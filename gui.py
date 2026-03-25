@@ -26,7 +26,7 @@ from typing import Optional
 
 import config
 from data_manager import DataManager
-from scraper import ScraperScheduler, run_scrape_session
+from scraper import ScraperScheduler, run_scrape_session, run_historical_backfill
 from ai_model import BetpawaAI
 
 # ── Colour palette ─────────────────────────────────────────────────────────────
@@ -46,17 +46,24 @@ FONT_TITLE = ("Consolas", 14, "bold")
 FONT_SMALL = ("Consolas", 9)
 
 
+MAX_LOG_LINES = 1000
+MAX_TABLE_ROWS = 100
+
+
 class BetpawaTrackerGUI:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.db = DataManager()
         self.ai = BetpawaAI()
         self.scheduler: Optional[ScraperScheduler] = None
+        self._background_threads: list[threading.Thread] = []
+        self._backfill_running = False
 
         root.title("Betpawa MUN Tracker — AI Edition")
         root.configure(bg=BG_DARK)
         root.geometry("1100x780")
         root.minsize(900, 640)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._build_ui()
         self._refresh_loop()
@@ -118,11 +125,30 @@ class BetpawaTrackerGUI:
             bg=BG_MID, fg=FG_WHITE, font=FONT_SMALL,
         ).pack(anchor="w", padx=8, pady=(2, 6))
 
+        self.backfill_status_var = tk.StringVar(value="History: Idle")
+        tk.Label(
+            frame, textvariable=self.backfill_status_var,
+            bg=BG_MID, fg=FG_PURPLE, font=FONT_SMALL,
+        ).pack(anchor="w", padx=8, pady=(0, 4))
+
+        self.backfill_progress_var = tk.DoubleVar(value=0.0)
+        self.backfill_progress = ttk.Progressbar(
+            frame,
+            orient="horizontal",
+            length=220,
+            mode="determinate",
+            variable=self.backfill_progress_var,
+            maximum=100,
+        )
+        self.backfill_progress.pack(anchor="w", padx=8, pady=(0, 6))
+
         btn_row = tk.Frame(frame, bg=BG_MID)
         btn_row.pack(pady=6)
         self._btn(btn_row, "▶ Start", FG_GREEN, self._start_scheduler).pack(side=tk.LEFT, padx=4)
         self._btn(btn_row, "■ Stop", FG_RED, self._stop_scheduler).pack(side=tk.LEFT, padx=4)
         self._btn(btn_row, "⚡ Scrape Now", FG_YELLOW, self._scrape_now).pack(side=tk.LEFT, padx=4)
+        self.backfill_btn = self._btn(btn_row, "🗂 Backfill History", FG_PURPLE, self._backfill_history)
+        self.backfill_btn.pack(side=tk.LEFT, padx=4)
 
     # ── AI panel ──────────────────────────────────────────────────────────────
 
@@ -180,7 +206,12 @@ class BetpawaTrackerGUI:
         )
         frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
 
-        columns = ("id", "timestamp", "home", "score", "away", "outcome", "raw")
+        # Header frame for table tools (like the delete button)
+        tool_frame = tk.Frame(frame, bg=BG_DARK)
+        tool_frame.pack(fill=tk.X, padx=4, pady=2)
+        self._btn(tool_frame, "🗑 Clear Results", FG_RED, self._clear_results).pack(side=tk.RIGHT)
+
+        columns = ("id", "timestamp", "source", "home", "score", "away", "outcome", "raw")
         self.tree = ttk.Treeview(frame, columns=columns, show="headings", height=8)
 
         # Style the treeview
@@ -200,6 +231,7 @@ class BetpawaTrackerGUI:
         headers = {
             "id": ("#", 40),
             "timestamp": ("Timestamp", 140),
+            "source": ("Source", 80),
             "home": ("Home", 80),
             "score": ("FT Score", 90),
             "away": ("Away", 80),
@@ -220,6 +252,8 @@ class BetpawaTrackerGUI:
         self.tree.tag_configure("win", foreground=FG_GREEN)
         self.tree.tag_configure("draw", foreground=FG_YELLOW)
         self.tree.tag_configure("loss", foreground=FG_RED)
+        self.tree.tag_configure("historical", background="#2b233a")
+        self.tree.tag_configure("live", background=BG_LIGHT)
 
     # ── Log panel ─────────────────────────────────────────────────────────────
 
@@ -266,10 +300,14 @@ class BetpawaTrackerGUI:
     # ── Logging helper ────────────────────────────────────────────────────────
 
     def _append_log(self, msg: str) -> None:
-        """Append a message to the log widget (thread-safe)."""
+        """Append a message to the log widget (thread-safe), trimming to MAX_LOG_LINES."""
         def _do():
             self.log_text.configure(state=tk.NORMAL)
             self.log_text.insert(tk.END, msg + "\n")
+            # Trim log to MAX_LOG_LINES
+            line_count = int(self.log_text.index("end-1c").split(".")[0])
+            if line_count > MAX_LOG_LINES:
+                self.log_text.delete("1.0", f"{line_count - MAX_LOG_LINES}.0")
             self.log_text.see(tk.END)
             self.log_text.configure(state=tk.DISABLED)
         self.root.after(0, _do)
@@ -294,10 +332,58 @@ class BetpawaTrackerGUI:
 
     def _scrape_now(self) -> None:
         self._append_log("🔄 Running immediate scrape session …")
-        threading.Thread(
-            target=lambda: run_scrape_session(self.db, self._append_log),
+        t = threading.Thread(
+            target=self._safe_run,
+            args=(lambda: run_scrape_session(self.db, self._append_log),),
             daemon=True,
-        ).start()
+        )
+        self._background_threads.append(t)
+        t.start()
+
+    def _backfill_history(self) -> None:
+        if self._backfill_running:
+            self._append_log("Historical backfill is already running.")
+            return
+
+        if not messagebox.askyesno(
+            "Backfill History",
+            "Import historical MUN results from Betpawa into the database?\nThis may take a few minutes.",
+        ):
+            return
+
+        self._backfill_running = True
+        self.backfill_btn.configure(state=tk.DISABLED)
+        self.backfill_progress_var.set(0)
+        self.backfill_status_var.set("History: Starting …")
+
+        def _progress(completed: int, total: int, status: str) -> None:
+            def _update() -> None:
+                self.backfill_status_var.set(f"History: {status}")
+                if total > 0:
+                    self.backfill_progress_var.set((completed / total) * 100)
+                else:
+                    self.backfill_progress_var.set(0)
+            self.root.after(0, _update)
+
+        def _run() -> None:
+            inserted = run_historical_backfill(
+                self.db,
+                log_callback=self._append_log,
+                progress_callback=_progress,
+            )
+
+            def _finish() -> None:
+                self._backfill_running = False
+                self.backfill_btn.configure(state=tk.NORMAL)
+                self.backfill_progress_var.set(100)
+                self.backfill_status_var.set(f"History: Done ({inserted} imported)")
+
+            self.root.after(0, _finish)
+
+        self._append_log("🗂 Starting historical backfill …")
+        t = threading.Thread(target=self._safe_run, args=(_run,), daemon=True)
+        self._background_threads.append(t)
+        t.start()
 
     # ── AI controls ───────────────────────────────────────────────────────────
 
@@ -344,7 +430,9 @@ class BetpawaTrackerGUI:
                 f"QL acc={summary['ql_accuracy']:.2%}"
             )
 
-        threading.Thread(target=_run, daemon=True).start()
+        t = threading.Thread(target=self._safe_run, args=(_run,), daemon=True)
+        self._background_threads.append(t)
+        t.start()
 
     def _predict(self) -> None:
         outcomes = self.db.get_outcomes()
@@ -352,14 +440,48 @@ class BetpawaTrackerGUI:
         if len(outcomes) < 2:
             self._append_log("⚠  Not enough data to predict yet.")
             return
-        result = self.ai.predict(outcomes, goals)
+
+        # Fetch latest upcoming odds
+        upcoming = self.db.get_upcoming_matches(1)
+        odds = None
+        if upcoming:
+            match = upcoming[0]
+            odds = (match['home_odds'], match['draw_odds'], match['away_odds'])
+
+        result = self.ai.predict(outcomes, goals, odds)
         label = (
             f"GA: {result['ga_label']} ({result['ga_confidence']:.0%}) | "
             f"QL: {result['ql_label']} | "
+            f"LSTM: {result['lstm_label']} ({result['lstm_confidence']:.0%}) | "
             f"Consensus: {result['consensus_label']}"
         )
         self.prediction_var.set(f"🔮 {result['consensus_label']}")
         self._append_log(f"Prediction → {label}")
+
+    # ── Thread safety helpers ─────────────────────────────────────────────────
+
+    def _safe_run(self, func) -> None:
+        """Wrapper that catches exceptions in background threads and logs them."""
+        try:
+            func()
+        except Exception as exc:
+            self.root.after(0, self._reset_backfill_state)
+            self._append_log(f"❌ Background task error: {exc}")
+
+    def _reset_backfill_state(self) -> None:
+        self._backfill_running = False
+        if hasattr(self, "backfill_btn"):
+            self.backfill_btn.configure(state=tk.NORMAL)
+        if hasattr(self, "backfill_status_var"):
+            self.backfill_status_var.set("History: Idle")
+
+    def _on_close(self) -> None:
+        """Gracefully shut down scheduler and threads before closing."""
+        if self.scheduler:
+            self.scheduler.stop()
+        for t in self._background_threads:
+            t.join(timeout=5)
+        self.root.destroy()
 
     # ── Refresh loop ──────────────────────────────────────────────────────────
 
@@ -372,6 +494,18 @@ class BetpawaTrackerGUI:
         except Exception:
             pass
         self.root.after(1000, self._refresh_loop)
+
+    def _clear_results(self) -> None:
+        """Clear all stored results after confirmation."""
+        if messagebox.askyesno(
+            "Clear Data",
+            "Are you sure you want to delete all stored match results?\nThis cannot be undone."
+        ):
+            self.db.clear_all_results()
+            # Clear GUI table
+            for iid in self.tree.get_children():
+                self.tree.delete(iid)
+            self._append_log("🗑 All match results have been deleted.")
 
     def _refresh_table(self) -> None:
         rows = self.db.get_recent_results(50)
@@ -388,6 +522,7 @@ class BetpawaTrackerGUI:
                 config.RESULT_DRAW: "draw",
                 config.RESULT_LOSS: "loss",
             }.get(row["outcome"], "")
+            source_tag = row["source"] if row["source"] in ("live", "historical") else "live"
             score = f"{row['ft_home']} - {row['ft_away']}"
             ts_short = row["timestamp"][:16].replace("T", " ")
             self.tree.insert(
@@ -395,18 +530,28 @@ class BetpawaTrackerGUI:
                 values=(
                     row["id"],
                     ts_short,
+                    row["source"].title(),
                     row["team_home"],
                     score,
                     row["team_away"],
                     outcome_label,
                     row["raw_result"][:40],
                 ),
-                tags=(tag,),
+                tags=(tag, source_tag),
             )
+
+        # Prune table to MAX_TABLE_ROWS
+        children = self.tree.get_children()
+        if len(children) > MAX_TABLE_ROWS:
+            for iid in children[MAX_TABLE_ROWS:]:
+                self.tree.delete(iid)
 
     def _refresh_stats(self) -> None:
         n = self.db.count_results()
-        self.total_results_var.set(f"Stored results: {n}")
+        source_counts = self.db.count_results_by_source()
+        self.total_results_var.set(
+            f"Stored results: {n}  |  Live: {source_counts['live']}  |  Historical: {source_counts['historical']}"
+        )
 
         summary = self.ai.summary()
         self.ga_gen_var.set(f"Generation: {summary['ga_generation']}")

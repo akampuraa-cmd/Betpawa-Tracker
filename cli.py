@@ -18,6 +18,9 @@ python cli.py train --ga-generations 50
 # Predict the next MUN match outcome
 python cli.py predict
 
+# Show upcoming matches with odds
+python cli.py upcoming --count 5
+
 # Show scraper + AI status summary
 python cli.py status
 """
@@ -31,7 +34,7 @@ from typing import List
 
 import config
 from data_manager import DataManager
-from scraper import run_scrape_session, ScraperScheduler
+from scraper import run_scrape_session, ScraperScheduler, run_historical_backfill
 from ai_model import BetpawaAI
 
 # ── Logging setup ─────────────────────────────────────────────────────────────
@@ -198,6 +201,14 @@ def cmd_predict(args, db: DataManager) -> None:
         print(_c("  ⚠  Not enough data to predict yet.", _YELLOW))
         return
 
+    # Fetch latest upcoming odds
+    upcoming = db.get_upcoming_matches(1)
+    odds = None
+    if upcoming:
+        match = upcoming[0]
+        odds = (match['home_odds'], match['draw_odds'], match['away_odds'])
+        print(f"  Using odds: Home {odds[0]}, Draw {odds[1]}, Away {odds[2]}")
+
     ai = BetpawaAI()
     # Quick re-train so the prediction reflects all available data
     if len(outcomes) >= 3:
@@ -206,7 +217,7 @@ def cmd_predict(args, db: DataManager) -> None:
             ga_generations=min(50, config.GA_GENERATIONS),
         )
 
-    result = ai.predict(outcomes, goals)
+    result = ai.predict(outcomes, goals, odds)
     colour = {
         config.RESULT_WIN: _GREEN,
         config.RESULT_DRAW: _YELLOW,
@@ -219,7 +230,31 @@ def cmd_predict(args, db: DataManager) -> None:
         f"(confidence {result['ga_confidence']:.0%})"
     )
     print(f"  Q-Learning         →  {_c(result['ql_label'], _YELLOW)}")
+    print(
+        f"  LSTM Model         →  {_c(result['lstm_label'], _CYAN)}  "
+        f"(confidence {result['lstm_confidence']:.0%})"
+    )
     print(f"\n  {_c('Consensus prediction', _BOLD)}:  {_c(result['consensus_label'], colour)}")
+
+
+def cmd_upcoming(args, db: DataManager) -> None:
+    """Show upcoming matches with odds."""
+    _print_header("Betpawa Tracker — Upcoming Matches")
+
+    upcoming = db.get_upcoming_matches(args.count)
+    if not upcoming:
+        print(_c("  No upcoming matches stored yet.", _YELLOW))
+        return
+
+    print(f"  Showing last {len(upcoming)} upcoming matches:\n")
+    for i, match in enumerate(upcoming, 1):
+        home = match['team_home']
+        away = match['team_away']
+        home_odds = match['home_odds'] or 'N/A'
+        draw_odds = match['draw_odds'] or 'N/A'
+        away_odds = match['away_odds'] or 'N/A'
+        timestamp = match['timestamp'][:19]  # YYYY-MM-DD HH:MM:SS
+        print(f"  {i}. {home} vs {away}  (Home: {home_odds}, Draw: {draw_odds}, Away: {away_odds})  [{timestamp}]")
 
 
 def cmd_status(args, db: DataManager) -> None:
@@ -244,7 +279,43 @@ def cmd_status(args, db: DataManager) -> None:
               f"{_c(f'D{draws}', _YELLOW)} {_c(f'L{losses}', _RED)}")
 
 
+def cmd_backfill(args, db: DataManager) -> None:
+    """Import historical results from the Betpawa Results/Matchday pages."""
+    _print_header("Betpawa Tracker — Historical Backfill")
+    print(
+        f"  Importing {args.seasons} season(s) × {args.matchdays} matchday pages"
+    )
+    if args.start_season_id:
+        print(f"  Starting from season #{args.start_season_id}")
+    else:
+        print("  Starting season will be discovered from the Results page")
+
+    def _log(msg: str) -> None:
+        print(f"  {msg}")
+
+    inserted = run_historical_backfill(
+        db,
+        seasons=args.seasons,
+        matchdays=args.matchdays,
+        start_season_id=args.start_season_id,
+        log_callback=_log,
+    )
+    colour = _GREEN if inserted > 0 else _YELLOW
+    print(_c(f"\n  Done — {inserted} historical result(s) imported.", colour))
+
+
 # ── Argument parser ───────────────────────────────────────────────────────────
+
+def _positive_int(value: str) -> int:
+    """Argparse type that rejects non-positive integers."""
+    try:
+        ivalue = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid int value: '{value}'")
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError(f"value must be a positive integer, got {ivalue}")
+    return ivalue
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -265,18 +336,48 @@ def build_parser() -> argparse.ArgumentParser:
 
     # results
     p_res = sub.add_parser("results", help="Show the last N stored results")
-    p_res.add_argument("--count", type=int, default=20, metavar="N",
+    p_res.add_argument("--count", type=_positive_int, default=20, metavar="N",
                        help="How many results to show (default: 20)")
 
     # train
     p_train = sub.add_parser("train", help="Train both AI models on stored data")
     p_train.add_argument(
-        "--ga-generations", type=int, default=config.GA_GENERATIONS, metavar="N",
+        "--ga-generations", type=_positive_int, default=config.GA_GENERATIONS, metavar="N",
         help=f"Number of GA generations (default: {config.GA_GENERATIONS})",
     )
 
     # predict
     sub.add_parser("predict", help="Predict the next MUN match outcome")
+
+    # upcoming
+    p_upcoming = sub.add_parser("upcoming", help="Show upcoming matches with odds")
+    p_upcoming.add_argument("--count", type=_positive_int, default=10, metavar="N",
+                            help="How many upcoming matches to show (default: 10)")
+    p_backfill = sub.add_parser(
+        "backfill",
+        help="Import historical results from Betpawa Results/Matchday pages",
+    )
+    p_backfill.add_argument(
+        "--seasons",
+        type=_positive_int,
+        default=config.HISTORICAL_SEASONS_LIMIT,
+        metavar="N",
+        help=f"How many seasons to import (default: {config.HISTORICAL_SEASONS_LIMIT})",
+    )
+    p_backfill.add_argument(
+        "--matchdays",
+        type=_positive_int,
+        default=config.HISTORICAL_MATCHDAYS,
+        metavar="N",
+        help=f"How many matchdays per season to import (default: {config.HISTORICAL_MATCHDAYS})",
+    )
+    p_backfill.add_argument(
+        "--start-season-id",
+        type=_positive_int,
+        default=None,
+        metavar="ID",
+        help="Optional explicit season id to start from instead of auto-discovery",
+    )
 
     # status
     sub.add_parser("status", help="Show status and stats")
@@ -298,6 +399,8 @@ def main(argv: List[str] = None) -> int:
         "results": cmd_results,
         "train": cmd_train,
         "predict": cmd_predict,
+        "upcoming": cmd_upcoming,
+        "backfill": cmd_backfill,
         "status": cmd_status,
     }
 

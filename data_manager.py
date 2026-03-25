@@ -39,7 +39,8 @@ class DataManager:
                     mun_goals       INTEGER NOT NULL,
                     opp_goals       INTEGER NOT NULL,
                     outcome         INTEGER NOT NULL,   -- 0=Loss 1=Draw 2=Win
-                    raw_result      TEXT    NOT NULL
+                    raw_result      TEXT    NOT NULL,
+                    source          TEXT    NOT NULL DEFAULT 'live'
                 )
                 """
             )
@@ -53,6 +54,28 @@ class DataManager:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS upcoming_matches (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp   TEXT    NOT NULL,
+                    team_home   TEXT    NOT NULL,
+                    team_away   TEXT    NOT NULL,
+                    home_odds   REAL,
+                    draw_odds   REAL,
+                    away_odds   REAL,
+                    source      TEXT    NOT NULL DEFAULT 'upcoming'
+                )
+                """
+            )
+            columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(results)").fetchall()
+            }
+            if "source" not in columns:
+                conn.execute(
+                    "ALTER TABLE results ADD COLUMN source TEXT NOT NULL DEFAULT 'live'"
+                )
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -72,10 +95,14 @@ class DataManager:
         ft_home: int,
         ft_away: int,
         raw_result: str,
+        source: str = "live",
+        deduplicate: bool = True,
     ) -> Optional[int]:
         """
-        Persist a match result.  Returns the new row id, or None if this exact
-        raw_result was already stored in the last 5 minutes (deduplication).
+        Persist a match result.
+
+        Returns the new row id, or None when the live-scrape deduplication
+        rule rejects the insert.
         """
         # Determine which side is MUN
         if team_home.upper() == config.TEAM_NAME:
@@ -95,26 +122,30 @@ class DataManager:
         now = datetime.now(timezone.utc).isoformat()
 
         with self._lock, self._connect() as conn:
-            # Deduplicate: same raw_result within the last 5 minutes
-            existing = conn.execute(
-                """
-                SELECT id FROM results
-                WHERE raw_result = ?
-                  AND timestamp >= datetime('now', '-5 minutes')
-                LIMIT 1
-                """,
-                (raw_result,),
-            ).fetchone()
-            if existing:
-                return None
+            if deduplicate:
+                # Live scraping revisits the same fixture several times while
+                # scores are updating. Keep dedup on for that path only.
+                existing = conn.execute(
+                    """
+                    SELECT id FROM results
+                    WHERE team_home = ? AND team_away = ?
+                      AND ft_home = ? AND ft_away = ?
+                      AND raw_result = ?
+                      AND timestamp >= datetime('now', '-10 minutes')
+                    LIMIT 1
+                    """,
+                    (team_home, team_away, ft_home, ft_away, raw_result),
+                ).fetchone()
+                if existing:
+                    return None
 
             cursor = conn.execute(
                 """
                 INSERT INTO results
                     (timestamp, team_home, team_away,
                      ht_home, ht_away, ft_home, ft_away,
-                     mun_goals, opp_goals, outcome, raw_result)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     mun_goals, opp_goals, outcome, raw_result, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     now,
@@ -128,6 +159,7 @@ class DataManager:
                     opp_goals,
                     outcome,
                     raw_result,
+                    source,
                 ),
             )
             return cursor.lastrowid
@@ -201,9 +233,65 @@ class DataManager:
         with self._lock, self._connect() as conn:
             return conn.execute("SELECT COUNT(*) FROM results").fetchone()[0]
 
+    def count_results_by_source(self) -> dict[str, int]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT source, COUNT(*) AS total FROM results GROUP BY source"
+            ).fetchall()
+        counts = {"live": 0, "historical": 0}
+        for row in rows:
+            counts[row["source"]] = row["total"]
+        return counts
+
+    def clear_all_results(self) -> None:
+        """Delete all match results from the database."""
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM results")
+            conn.commit()
+
     def get_scrape_log(self, n: int = 50) -> List[sqlite3.Row]:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 "SELECT * FROM scrape_log ORDER BY id DESC LIMIT ?", (n,)
             ).fetchall()
         return list(reversed(rows))
+
+    # ── Upcoming matches ─────────────────────────────────────────────────────
+
+    def insert_upcoming_match(
+        self,
+        team_home: str,
+        team_away: str,
+        home_odds: Optional[float],
+        draw_odds: Optional[float],
+        away_odds: Optional[float],
+        source: str = "upcoming",
+    ) -> Optional[int]:
+        """Persist an upcoming match with odds."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO upcoming_matches
+                    (timestamp, team_home, team_away, home_odds, draw_odds, away_odds, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (now, team_home, team_away, home_odds, draw_odds, away_odds, source),
+            )
+            return cursor.lastrowid
+
+    def get_upcoming_matches(self, n: Optional[int] = None) -> List[sqlite3.Row]:
+        """Return upcoming matches, newest first."""
+        query = "SELECT * FROM upcoming_matches ORDER BY id DESC"
+        params: Tuple = ()
+        if n is not None:
+            query += " LIMIT ?"
+            params = (n,)
+        with self._lock, self._connect() as conn:
+            return conn.execute(query, params).fetchall()
+
+    def clear_upcoming_matches(self) -> None:
+        """Delete all upcoming matches from the database."""
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM upcoming_matches")
+            conn.commit()

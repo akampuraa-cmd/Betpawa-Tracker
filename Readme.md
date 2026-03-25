@@ -17,12 +17,13 @@ and predicts the next match outcome using a **Genetic Algorithm** and
 
 | Feature | Detail |
 |---|---|
-| 🔄 Web scraper | Selenium-based scraper; runs every **5 minutes** for **30 seconds** (polling every 5 s) |
+| 🔄 Web scraper | Brave/Selenium scraper; runs every **5 minutes** on clock boundaries and polls for up to **50 seconds** |
+| 🗂 Historical backfill | Imports up to **10 previous seasons** from Betpawa Results/Matchday pages into the same AI training database |
 | 🗄️ Database | SQLite – stores every MUN result with half-time and full-time scores |
 | 🧬 Genetic Algorithm | Evolves a linear classifier over match-history features |
 | 🤖 Q-Learning | Tabular RL agent that learns from the reward of each correct/wrong prediction |
 | 🖥️ GUI | Tkinter desktop app showing live scraper status, results table, AI stats, and backend log |
-| ⌨️ CLI | Full command-line interface (`start`, `scrape`, `results`, `train`, `predict`, `status`) |
+| ⌨️ CLI | Full command-line interface (`start`, `scrape`, `results`, `train`, `predict`, `backfill`, `status`) |
 
 ---
 
@@ -67,11 +68,11 @@ pip install -r requirements.txt
 > sudo apt install python3-tk   # Debian/Ubuntu
 > ```
 
-### 2. Chrome / ChromeDriver
+### 2. Brave / ChromeDriver
 
-The scraper uses **Google Chrome** in headless mode.
-[`webdriver-manager`](https://github.com/SergeyPirogov/webdriver_manager) downloads
-the correct ChromeDriver automatically on first run.
+The scraper uses **Brave Browser** in headless mode via Selenium's built-in
+driver management. Update `BRAVE_BINARY_PATH` in `config.py` if Brave is
+installed in a different location.
 
 ---
 
@@ -105,6 +106,9 @@ python main.py --cli train --ga-generations 100
 # Predict next MUN result
 python main.py --cli predict
 
+# Import historical seasons and matchdays for AI training
+python main.py --cli backfill --seasons 10 --matchdays 38
+
 # Status summary
 python main.py --cli status
 ```
@@ -123,17 +127,20 @@ python cli.py predict
 | Constant | Default | Description |
 |---|---|---|
 | `TARGET_URL` | betpawa.ug URL | Page to scrape |
+| `RESULTS_URL` | betpawa.ug Results URL | Results page used to discover historical seasons |
 | `TEAM_NAME` | `"MUN"` | Team to track |
 | `SCRAPE_INTERVAL_SECONDS` | `300` | Seconds between sessions (5 min) |
-| `SCRAPE_SESSION_DURATION_SECONDS` | `30` | How long each session runs |
+| `SCRAPE_SESSION_DURATION_SECONDS` | `50` | How long each live session runs |
 | `SCRAPE_POLL_INTERVAL_SECONDS` | `5` | Poll frequency within a session |
+| `HISTORICAL_SEASONS_LIMIT` | `10` | Default number of seasons to import for backfill |
+| `HISTORICAL_MATCHDAYS` | `38` | Default number of matchdays per season to import |
 | `GA_POPULATION_SIZE` | `50` | GA population size |
 | `GA_GENERATIONS` | `100` | Default training generations |
 | `GA_MUTATION_RATE` | `0.1` | GA mutation rate |
 | `QL_LEARNING_RATE` | `0.1` | Q-learning α |
 | `QL_DISCOUNT_FACTOR` | `0.9` | Q-learning γ |
 | `QL_EPSILON` | `0.2` | Initial exploration rate |
-| `HEADLESS` | `True` | Run Chrome headless |
+| `HEADLESS` | `True` | Run Brave headless |
 
 ---
 

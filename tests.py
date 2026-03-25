@@ -19,7 +19,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-from scraper import parse_result, _parse_row
+from scraper import parse_result, _parse_row, parse_matchday_text
 from data_manager import DataManager
 from ai_model import (
     _build_features,
@@ -80,6 +80,32 @@ class TestParseRow(unittest.TestCase):
         self.assertIsNone(_parse_row("MUN vs ARS"))
 
 
+class TestParseMatchdayText(unittest.TestCase):
+
+    def test_extracts_mun_fixture_from_matchday_page(self):
+        text = """
+        Back
+        MATCH DAY: 01
+        English League
+        ARS - WHU
+        (2 - 0)2 - 1
+        LEE - MUN
+        (1 - 0)1 - 0
+        TOT - BRE
+        (0 - 0)0 - 1
+        """
+        matches = parse_matchday_text(text)
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["team_home"], "LEE")
+        self.assertEqual(matches[0]["team_away"], "MUN")
+        self.assertEqual(matches[0]["ft_home"], 1)
+        self.assertEqual(matches[0]["ft_away"], 0)
+
+    def test_returns_empty_when_team_not_present(self):
+        text = "ARS - WHU (2 - 0)2 - 1 TOT - BRE (0 - 0)0 - 1"
+        self.assertEqual(parse_matchday_text(text), [])
+
+
 # ── DataManager ───────────────────────────────────────────────────────────────
 
 class TestDataManager(unittest.TestCase):
@@ -90,7 +116,12 @@ class TestDataManager(unittest.TestCase):
         self.db = DataManager(db_path=self._tmpfile.name)
 
     def tearDown(self):
-        os.unlink(self._tmpfile.name)
+        # Close any lingering SQLite connections before deleting on Windows
+        del self.db
+        try:
+            os.unlink(self._tmpfile.name)
+        except PermissionError:
+            pass  # Windows file-locking; temp dir will clean up later
 
     def _insert_win(self):
         return self.db.insert_result(
@@ -112,6 +143,51 @@ class TestDataManager(unittest.TestCase):
         self.assertIsNotNone(id1)
         self.assertIsNone(id2)
         self.assertEqual(self.db.count_results(), 1)
+
+    def test_insert_without_deduplication(self):
+        id1 = self._insert_win()
+        id2 = self.db.insert_result(
+            team_home="MUN", team_away="ARS",
+            ht_home=1, ht_away=0,
+            ft_home=2, ft_away=0,
+            raw_result="(1 - 0)2 - 0",
+            deduplicate=False,
+        )
+        self.assertIsNotNone(id1)
+        self.assertIsNotNone(id2)
+        self.assertEqual(self.db.count_results(), 2)
+
+    def test_result_source_is_stored(self):
+        self.db.insert_result(
+            team_home="MUN", team_away="CHE",
+            ht_home=0, ht_away=0,
+            ft_home=1, ft_away=0,
+            raw_result="(0 - 0)1 - 0",
+            source="historical",
+            deduplicate=False,
+        )
+        row = self.db.get_recent_results(1)[0]
+        self.assertEqual(row["source"], "historical")
+
+    def test_count_results_by_source(self):
+        self.db.insert_result(
+            team_home="MUN", team_away="ARS",
+            ht_home=1, ht_away=0,
+            ft_home=2, ft_away=0,
+            raw_result="(1 - 0)2 - 0",
+            source="live",
+        )
+        self.db.insert_result(
+            team_home="MUN", team_away="CHE",
+            ht_home=0, ht_away=1,
+            ft_home=0, ft_away=2,
+            raw_result="(0 - 1)0 - 2",
+            source="historical",
+            deduplicate=False,
+        )
+        counts = self.db.count_results_by_source()
+        self.assertEqual(counts["live"], 1)
+        self.assertEqual(counts["historical"], 1)
 
     def test_outcome_computed_correctly_win(self):
         self.db.insert_result(
@@ -142,6 +218,20 @@ class TestDataManager(unittest.TestCase):
         )
         outcomes = self.db.get_outcomes()
         self.assertEqual(outcomes, [config.RESULT_LOSS])
+
+    def test_clear_all_results(self):
+        self._insert_win()
+        # Insert a different match so it's not deduplicated
+        self.db.insert_result(
+            team_home="MUN", team_away="CHE",
+            ht_home=0, ht_away=1,
+            ft_home=0, ft_away=2,
+            raw_result="(0 - 1)0 - 2",
+        )
+        self.assertEqual(self.db.count_results(), 2)
+        
+        self.db.clear_all_results()
+        self.assertEqual(self.db.count_results(), 0)
 
     def test_goals_series(self):
         self.db.insert_result("MUN", "ARS", 1, 0, 3, 1, "(1 - 0)3 - 1")
@@ -328,6 +418,24 @@ class TestCLIParser(unittest.TestCase):
     def test_predict_command(self):
         args = self._parse(["predict"])
         self.assertEqual(args.command, "predict")
+
+    def test_backfill_defaults(self):
+        args = self._parse(["backfill"])
+        self.assertEqual(args.command, "backfill")
+        self.assertEqual(args.seasons, config.HISTORICAL_SEASONS_LIMIT)
+        self.assertEqual(args.matchdays, config.HISTORICAL_MATCHDAYS)
+        self.assertIsNone(args.start_season_id)
+
+    def test_backfill_custom_args(self):
+        args = self._parse([
+            "backfill",
+            "--seasons", "3",
+            "--matchdays", "12",
+            "--start-season-id", "137462",
+        ])
+        self.assertEqual(args.seasons, 3)
+        self.assertEqual(args.matchdays, 12)
+        self.assertEqual(args.start_season_id, 137462)
 
     def test_status_command(self):
         args = self._parse(["status"])

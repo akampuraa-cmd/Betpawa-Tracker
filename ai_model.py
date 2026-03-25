@@ -25,6 +25,9 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 import config
 
@@ -41,17 +44,20 @@ def _build_features(
     outcomes: List[int],
     goals: List[Tuple[int, int]],
     window: int,
+    odds: Optional[Tuple[float, float, float]] = None,
+    include_odds: bool = False,
 ) -> np.ndarray:
     """
     Build a feature vector from the last *window* matches.
 
-    Features (length = window * 2 + 4):
+    Features (length = window * 2 + 4 + 3 if include_odds else window * 2 + 4):
       - last *window* outcomes encoded as floats in [0, 1]   (0=L, 0.5=D, 1=W)
       - last *window* MUN goal counts (normalised by 5)
       - rolling mean goals scored   (last window)
       - rolling mean goals conceded (last window)
       - win rate   (last window)
       - draw rate  (last window)
+      - home_odds, draw_odds, away_odds (if include_odds is True, evaluated/padded)
     """
     def _encode(o: int) -> float:
         return {config.RESULT_LOSS: 0.0, config.RESULT_DRAW: 0.5, config.RESULT_WIN: 1.0}[o]
@@ -68,11 +74,22 @@ def _build_features(
     win_rate = float(np.mean([1.0 if o == config.RESULT_WIN else 0.0 for o in padded_out]))
     draw_rate = float(np.mean([1.0 if o == config.RESULT_DRAW else 0.0 for o in padded_out]))
 
-    return np.concatenate([out_enc, mun_g, [mean_mun, mean_opp, win_rate, draw_rate]])
+    features = [out_enc, mun_g, [mean_mun, mean_opp, win_rate, draw_rate]]
+
+    if include_odds:
+        if odds:
+            # Normalize odds by dividing by 10 (assuming typical odds <10)
+            norm_odds = [o / 10.0 if o else 0.0 for o in odds]
+            features.append(norm_odds)
+        else:
+            features.append([0.0, 0.0, 0.0])
+
+    return np.concatenate(features)
 
 
-def _feature_size(window: int) -> int:
-    return window * 2 + 4
+def _feature_size(window: int, include_odds: bool = False) -> int:
+    base = window * 2 + 4
+    return base + 3 if include_odds else base
 
 
 # ── Genetic Algorithm ─────────────────────────────────────────────────────────
@@ -93,6 +110,7 @@ class GeneticAlgorithm:
         crossover_rate: float = config.GA_CROSSOVER_RATE,
         elitism: int = config.GA_ELITISM_COUNT,
         feature_window: int = config.GA_FEATURE_WINDOW,
+        include_odds: bool = False,
     ):
         self.population_size = population_size
         self.generations = generations
@@ -100,7 +118,8 @@ class GeneticAlgorithm:
         self.crossover_rate = crossover_rate
         self.elitism = elitism
         self.feature_window = feature_window
-        self.n_features = _feature_size(feature_window)
+        self.include_odds = include_odds
+        self.n_features = _feature_size(feature_window, include_odds)
         self.gene_length = N_ACTIONS * (self.n_features + 1)  # W + b
 
         self.population: List[np.ndarray] = []
@@ -167,7 +186,7 @@ class GeneticAlgorithm:
         total = 0
         for i in range(start, len(outcomes)):
             # _build_features always returns a vector of self.n_features size
-            feats = _build_features(outcomes[:i], goals[:i], self.feature_window)
+            feats = _build_features(outcomes[:i], goals[:i], self.feature_window, include_odds=self.include_odds)
             pred = ACTIONS[int(np.argmax(self._predict_proba(individual, feats)))]
             if pred == outcomes[i]:
                 correct += 1
@@ -250,11 +269,11 @@ class GeneticAlgorithm:
             if callback:
                 callback(generation=self.generation, best_fitness=fit)
 
-    def get_features(self, outcomes: List[int], goals: List[Tuple[int, int]]) -> np.ndarray:
-        return _build_features(outcomes, goals, self.feature_window)
+    def get_features(self, outcomes: List[int], goals: List[Tuple[int, int]], odds: Optional[Tuple[float, float, float]] = None) -> np.ndarray:
+        return _build_features(outcomes, goals, self.feature_window, odds=odds, include_odds=self.include_odds)
 
-    def predict_next(self, outcomes: List[int], goals: List[Tuple[int, int]]) -> int:
-        feats = self.get_features(outcomes, goals)
+    def predict_next(self, outcomes: List[int], goals: List[Tuple[int, int]], odds: Optional[Tuple[float, float, float]] = None) -> int:
+        feats = self.get_features(outcomes, goals, odds)
         return self.predict(feats)
 
 
@@ -386,26 +405,114 @@ class QLearning:
         return self.correct_predictions / self.total_steps
 
 
+# ── LSTM ──────────────────────────────────────────────────────────────────────
+
+class PyTorchLSTM(nn.Module):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, num_classes: int = 3):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.fc = nn.Linear(hidden_size, num_classes)
+
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = out[:, -1, :]
+        out = self.fc(out)
+        return out
+
+
+class LSTMPredictor:
+    def __init__(
+        self,
+        seq_length: int = getattr(config, "LSTM_SEQUENCE_LENGTH", 10),
+        hidden_size: int = getattr(config, "LSTM_HIDDEN_SIZE", 32),
+        num_layers: int = getattr(config, "LSTM_NUM_LAYERS", 2),
+        lr: float = getattr(config, "LSTM_LEARNING_RATE", 0.005),
+    ):
+        self.seq_length = seq_length
+        self.input_size = 3  # encoded outcome, mun goals, opp goals
+        
+        self.model = PyTorchLSTM(self.input_size, hidden_size, num_layers)
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+
+    def _step_feature(self, outcome: int, mun_g: int, opp_g: int) -> List[float]:
+        enc = {config.RESULT_LOSS: 0.0, config.RESULT_DRAW: 0.5, config.RESULT_WIN: 1.0}[outcome]
+        return [enc, mun_g / 5.0, opp_g / 5.0]
+
+    def train(self, outcomes: List[int], goals: List[Tuple[int, int]], epochs: int = 50) -> None:
+        if len(outcomes) <= self.seq_length:
+            return
+
+        X, y = [], []
+        for i in range(len(outcomes) - self.seq_length):
+            seq_X = [
+                self._step_feature(outcomes[j], goals[j][0], goals[j][1])
+                for j in range(i, i + self.seq_length)
+            ]
+            X.append(seq_X)
+            y.append(outcomes[i + self.seq_length])
+        
+        X_tensor = torch.tensor(X, dtype=torch.float32)
+        y_tensor = torch.tensor(y, dtype=torch.long)
+
+        self.model.train()
+        for _ in range(epochs):
+            self.optimizer.zero_grad()
+            outputs = self.model(X_tensor)
+            loss = self.criterion(outputs, y_tensor)
+            loss.backward()
+            self.optimizer.step()
+
+    def predict_next(self, outcomes: List[int], goals: List[Tuple[int, int]]) -> Tuple[int, float]:
+        if len(outcomes) == 0:
+            return config.RESULT_DRAW, 0.0
+        
+        self.model.eval()
+        seq_X = []
+        
+        start_idx = max(0, len(outcomes) - self.seq_length)
+        pad_count = self.seq_length - (len(outcomes) - start_idx)
+        
+        for _ in range(pad_count):
+            seq_X.append(self._step_feature(config.RESULT_DRAW, 0, 0)) # Default padding
+        
+        for i in range(start_idx, len(outcomes)):
+            seq_X.append(self._step_feature(outcomes[i], goals[i][0], goals[i][1]))
+        
+        with torch.no_grad():
+            x_tensor = torch.tensor([seq_X], dtype=torch.float32)
+            logits = self.model(x_tensor)
+            probs = torch.softmax(logits, dim=1).squeeze(0)
+            pred = int(torch.argmax(probs).item())
+            conf = float(probs[pred].item())
+            
+        return ACTIONS[pred], conf
+
+
 # ── Combined AI interface ─────────────────────────────────────────────────────
 
 class BetpawaAI:
     """
-    Convenience wrapper combining the Genetic Algorithm and Q-Learning models.
+    Convenience wrapper combining the GA, Q-Learning, and LSTM models.
     """
 
     def __init__(self):
-        self.ga = GeneticAlgorithm()
+        self.ga = GeneticAlgorithm(include_odds=True)
         self.ql = QLearning()
+        self.lstm = LSTMPredictor()
 
     def train(
         self,
         outcomes: List[int],
         goals: List[Tuple[int, int]],
         ga_generations: Optional[int] = None,
+        lstm_epochs: Optional[int] = None,
         ga_callback=None,
         ql_callback=None,
     ) -> None:
-        """Train both models on historical data."""
+        """Train all models on historical data."""
         if len(outcomes) < 2:
             logger.info("Not enough data to train (need ≥ 2 results)")
             return
@@ -416,10 +523,15 @@ class BetpawaAI:
         logger.info("Training Q-Learning agent …")
         self.ql.train(outcomes, callback=ql_callback)
 
+        logger.info("Training LSTM agent …")
+        epochs = lstm_epochs or getattr(config, "LSTM_EPOCHS", 50)
+        self.lstm.train(outcomes, goals, epochs=epochs)
+
     def predict(
         self,
         outcomes: List[int],
         goals: List[Tuple[int, int]],
+        odds: Optional[Tuple[float, float, float]] = None,
     ) -> Dict[str, object]:
         """
         Return a combined prediction dict:
@@ -429,25 +541,42 @@ class BetpawaAI:
             "ga_confidence": float,
             "ql_prediction": int,
             "ql_label": str,
+            "lstm_prediction": int,
+            "lstm_label": str,
+            "lstm_confidence": float,
             "consensus": int,
             "consensus_label": str,
           }
         """
-        ga_pred = self.ga.predict_next(outcomes, goals)
+        ga_pred = self.ga.predict_next(outcomes, goals, odds)
         ql_pred = self.ql.predict_next(outcomes)
+        lstm_pred, lstm_conf = self.lstm.predict_next(outcomes, goals)
 
         # GA confidence = best individual's softmax probability
         if self.ga.best_individual is not None:
-            feats = self.ga.get_features(outcomes, goals)
+            feats = self.ga.get_features(outcomes, goals, odds)
             proba = self.ga._predict_proba(self.ga.best_individual, feats)
             ga_conf = float(np.max(proba))
         else:
             ga_conf = 0.0
 
-        # Consensus: agreement → use that; disagreement → trust GA (has confidence)
-        consensus = ga_pred if ga_pred == ql_pred else (
-            ga_pred if ga_conf >= 0.5 else ql_pred
-        )
+        # Consensus logic: Majority vote among GA, QL, LSTM
+        preds = [ga_pred, ql_pred, lstm_pred]
+        votes = {config.RESULT_WIN: 0, config.RESULT_DRAW: 0, config.RESULT_LOSS: 0}
+        for p in preds:
+            votes[p] += 1
+        
+        max_votes = max(votes.values())
+        tied = [k for k, v in votes.items() if v == max_votes]
+        
+        if len(tied) == 1:
+            consensus = tied[0]
+        else:
+            # Disagreement (3 different votes, or tie) -> trust the one with max confidence
+            if lstm_conf >= ga_conf:
+                consensus = lstm_pred
+            else:
+                consensus = ga_pred
 
         return {
             "ga_prediction": ga_pred,
@@ -455,6 +584,9 @@ class BetpawaAI:
             "ga_confidence": ga_conf,
             "ql_prediction": ql_pred,
             "ql_label": config.RESULT_LABELS[ql_pred],
+            "lstm_prediction": lstm_pred,
+            "lstm_label": config.RESULT_LABELS[lstm_pred],
+            "lstm_confidence": lstm_conf,
             "consensus": consensus,
             "consensus_label": config.RESULT_LABELS[consensus],
         }
@@ -467,4 +599,5 @@ class BetpawaAI:
             "ql_accuracy": round(self.ql.accuracy, 4),
             "ql_epsilon": round(self.ql.epsilon, 4),
             "ql_q_table_size": len(self.ql.q_table),
+            "lstm_params": sum(p.numel() for p in self.lstm.model.parameters())
         }
