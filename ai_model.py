@@ -24,7 +24,7 @@ import pickle
 import random
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple, cast
 
 import numpy as np
 import torch
@@ -38,7 +38,27 @@ logger = logging.getLogger(__name__)
 # Action space: three possible predictions
 ACTIONS = [config.RESULT_LOSS, config.RESULT_DRAW, config.RESULT_WIN]
 N_ACTIONS = len(ACTIONS)
-MODEL_STATE_VERSION = 1
+MODEL_STATE_VERSION = 2
+
+
+def _as_int(value: object) -> int:
+    return int(cast(Any, value))
+
+
+def _as_float(value: object) -> float:
+    return float(cast(Any, value))
+
+
+def _as_list(value: object) -> List[object]:
+    if not isinstance(value, list):
+        raise ValueError("Expected checkpoint list")
+    return value
+
+
+def _as_dict(value: object) -> Dict[str, object]:
+    if not isinstance(value, dict):
+        raise ValueError("Expected checkpoint dict")
+    return value
 
 
 # ── Feature engineering ───────────────────────────────────────────────────────
@@ -53,24 +73,28 @@ def _build_features(
     """
     Build a feature vector from the last *window* matches.
 
-    Features (length = window * 2 + 4 + 3 if include_odds else window * 2 + 4):
-      - last *window* outcomes encoded as floats in [0, 1]   (0=L, 0.5=D, 1=W)
+    Features (length = window * 4 + 4 + 4 if include_odds else window * 4 + 4):
+      - last *window* outcomes one-hot encoded as [L, D, W] blocks
       - last *window* MUN goal counts (normalised by 5)
       - rolling mean goals scored   (last window)
       - rolling mean goals conceded (last window)
       - win rate   (last window)
       - draw rate  (last window)
-      - home_odds, draw_odds, away_odds (if include_odds is True, evaluated/padded)
+      - odds_present, home_odds, draw_odds, away_odds (if include_odds is True)
     """
-    def _encode(o: int) -> float:
-        return {config.RESULT_LOSS: 0.0, config.RESULT_DRAW: 0.5, config.RESULT_WIN: 1.0}[o]
+    def _encode(o: int) -> np.ndarray:
+        if o == config.RESULT_LOSS:
+            return np.array([1.0, 0.0, 0.0], dtype=float)
+        if o == config.RESULT_DRAW:
+            return np.array([0.0, 1.0, 0.0], dtype=float)
+        return np.array([0.0, 0.0, 1.0], dtype=float)
 
     padded_out = ([config.RESULT_DRAW] * window + outcomes)[-window:]
     padded_goals = ([(0, 0)] * window + goals)[-window:]
 
-    out_enc = np.array([_encode(o) for o in padded_out], dtype=float)
-    mun_g = np.array([g[0] / 5.0 for g in padded_goals], dtype=float)
-    opp_g = np.array([g[1] / 5.0 for g in padded_goals], dtype=float)
+    out_enc = np.concatenate([_encode(o) for o in padded_out])
+    mun_g = np.array([min(g[0], 5) / 5.0 for g in padded_goals], dtype=float)
+    opp_g = np.array([min(g[1], 5) / 5.0 for g in padded_goals], dtype=float)
 
     mean_mun = float(np.mean(mun_g))
     mean_opp = float(np.mean(opp_g))
@@ -81,18 +105,36 @@ def _build_features(
 
     if include_odds:
         if odds:
-            # Normalize odds by dividing by 10 (assuming typical odds <10)
+            # Normalize odds and add an explicit presence flag.
             norm_odds = [o / 10.0 if o else 0.0 for o in odds]
-            features.append(norm_odds)
+            features.append([1.0, *norm_odds])
         else:
-            features.append([0.0, 0.0, 0.0])
+            features.append([0.0, 0.0, 0.0, 0.0])
 
     return np.concatenate(features)
 
 
 def _feature_size(window: int, include_odds: bool = False) -> int:
-    base = window * 2 + 4
-    return base + 3 if include_odds else base
+    base = window * 4 + 4
+    return base + 4 if include_odds else base
+
+
+def _build_training_matrices(
+    outcomes: List[int],
+    goals: List[Tuple[int, int]],
+    window: int,
+    include_odds: bool = False,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Build the cached feature matrix and labels used by GA fitness."""
+    if len(outcomes) < 2:
+        return np.empty((0, _feature_size(window, include_odds))), np.empty((0,), dtype=int)
+
+    start = min(window, len(outcomes) - 1)
+    features = [
+        _build_features(outcomes[:i], goals[:i], window, include_odds=include_odds)
+        for i in range(start, len(outcomes))
+    ]
+    return np.vstack(features), np.array(outcomes[start:], dtype=int)
 
 
 # ── Genetic Algorithm ─────────────────────────────────────────────────────────
@@ -114,6 +156,7 @@ class GeneticAlgorithm:
         elitism: int = config.GA_ELITISM_COUNT,
         feature_window: int = config.GA_FEATURE_WINDOW,
         include_odds: bool = False,
+        seed: Optional[int] = None,
     ):
         self.population_size = population_size
         self.generations = generations
@@ -122,6 +165,7 @@ class GeneticAlgorithm:
         self.elitism = elitism
         self.feature_window = feature_window
         self.include_odds = include_odds
+        self.seed = seed
         self.n_features = _feature_size(feature_window, include_odds)
         self.gene_length = N_ACTIONS * (self.n_features + 1)  # W + b
 
@@ -130,6 +174,10 @@ class GeneticAlgorithm:
         self.best_fitness: float = 0.0
         self.generation: int = 0
         self.fitness_history: List[float] = []
+
+        if self.seed is not None:
+            random.seed(self.seed)
+            np.random.seed(self.seed)
 
         self._init_population()
 
@@ -169,33 +217,19 @@ class GeneticAlgorithm:
     def evaluate_fitness(
         self,
         individual: np.ndarray,
-        outcomes: List[int],
-        goals: List[Tuple[int, int]],
+        feature_matrix: np.ndarray,
+        labels: np.ndarray,
     ) -> float:
         """
-        Leave-one-out accuracy: for each position i ≥ 1, build features from
-        outcomes[:i] (padding fills missing history) and predict outcomes[i].
-
-        Uses at least 1 training point as long as there are ≥ 2 samples.
+        Vectorized leave-one-out accuracy over a cached feature matrix.
         """
-        if len(outcomes) < 2:
+        if feature_matrix.size == 0:
             return 0.0
 
-        # Start from max(1, window) when enough data is available; fall back
-        # to 1 when we have fewer samples than the configured window.
-        start = min(self.feature_window, len(outcomes) - 1)
-
-        correct = 0
-        total = 0
-        for i in range(start, len(outcomes)):
-            # _build_features always returns a vector of self.n_features size
-            feats = _build_features(outcomes[:i], goals[:i], self.feature_window, include_odds=self.include_odds)
-            pred = ACTIONS[int(np.argmax(self._predict_proba(individual, feats)))]
-            if pred == outcomes[i]:
-                correct += 1
-            total += 1
-
-        return correct / total if total > 0 else 0.0
+        W, b = self._decode(individual)
+        logits = feature_matrix @ W.T + b
+        preds = np.argmax(logits, axis=1)
+        return float(np.mean(preds == labels))
 
     # ── Genetic operators ─────────────────────────────────────────────────────
 
@@ -228,16 +262,51 @@ class GeneticAlgorithm:
         goals: List[Tuple[int, int]],
     ) -> float:
         """Run one generation.  Returns the best fitness of this generation."""
+        feature_matrix, labels = _build_training_matrices(
+            outcomes,
+            goals,
+            self.feature_window,
+            include_odds=self.include_odds,
+        )
+        return self.train_one_generation_from_cache(feature_matrix, labels)
+
+    def train(
+        self,
+        outcomes: List[int],
+        goals: List[Tuple[int, int]],
+        generations: Optional[int] = None,
+        callback=None,
+    ) -> None:
+        """Train for *generations* generations (default: self.generations)."""
+        n = generations or self.generations
+        feature_matrix, labels = _build_training_matrices(
+            outcomes,
+            goals,
+            self.feature_window,
+            include_odds=self.include_odds,
+        )
+        for g in range(n):
+            fit = self.train_one_generation_from_cache(feature_matrix, labels)
+            if callback:
+                callback(generation=self.generation, best_fitness=fit)
+
+    def train_one_generation_from_cache(
+        self,
+        feature_matrix: np.ndarray,
+        labels: np.ndarray,
+    ) -> float:
+        """Run one generation using cached training features and labels."""
+        if feature_matrix.size == 0:
+            return 0.0
+
         fitnesses = [
-            self.evaluate_fitness(ind, outcomes, goals)
+            self.evaluate_fitness(ind, feature_matrix, labels)
             for ind in self.population
         ]
 
-        # Elitism: carry over best individuals unchanged
         sorted_idx = sorted(range(len(fitnesses)), key=lambda i: fitnesses[i], reverse=True)
         new_pop = [self.population[i].copy() for i in sorted_idx[: self.elitism]]
 
-        # Fill the rest with children
         while len(new_pop) < self.population_size:
             p1 = self._select(fitnesses)
             p2 = self._select(fitnesses)
@@ -257,20 +326,6 @@ class GeneticAlgorithm:
 
         self.fitness_history.append(gen_best)
         return gen_best
-
-    def train(
-        self,
-        outcomes: List[int],
-        goals: List[Tuple[int, int]],
-        generations: Optional[int] = None,
-        callback=None,
-    ) -> None:
-        """Train for *generations* generations (default: self.generations)."""
-        n = generations or self.generations
-        for g in range(n):
-            fit = self.train_one_generation(outcomes, goals)
-            if callback:
-                callback(generation=self.generation, best_fitness=fit)
 
     def get_features(self, outcomes: List[int], goals: List[Tuple[int, int]], odds: Optional[Tuple[float, float, float]] = None) -> np.ndarray:
         return _build_features(outcomes, goals, self.feature_window, odds=odds, include_odds=self.include_odds)
@@ -301,20 +356,33 @@ class GeneticAlgorithm:
     def load_state_dict(self, state: Dict[str, object]) -> None:
         if state.get("version") != MODEL_STATE_VERSION:
             raise ValueError("Unsupported GeneticAlgorithm checkpoint version")
-        if int(state["population_size"]) != self.population_size:
+        if _as_int(state["population_size"]) != self.population_size:
             raise ValueError("Population size mismatch in checkpoint")
-        if int(state["feature_window"]) != self.feature_window or bool(state["include_odds"]) != self.include_odds:
+        if _as_int(state["feature_window"]) != self.feature_window or bool(state["include_odds"]) != self.include_odds:
             raise ValueError("Feature configuration mismatch in checkpoint")
+        if _as_int(state.get("n_features", self.n_features)) != self.n_features:
+            raise ValueError("Feature count mismatch in checkpoint")
+        if _as_int(state.get("gene_length", self.gene_length)) != self.gene_length:
+            raise ValueError("Gene length mismatch in checkpoint")
 
-        population = [np.array(ind, dtype=float) for ind in state["population"]]
+        population_data = _as_list(state["population"])
+        population = [np.array(ind, dtype=float) for ind in population_data]
         if not population:
             raise ValueError("Checkpoint does not contain a population")
+        if any(ind.size != self.gene_length for ind in population):
+            raise ValueError("Population shape mismatch in checkpoint")
 
         self.population = population
-        self.best_individual = None if state["best_individual"] is None else np.array(state["best_individual"], dtype=float)
-        self.best_fitness = float(state["best_fitness"])
-        self.generation = int(state["generation"])
-        self.fitness_history = [float(v) for v in state.get("fitness_history", [])]
+        if state["best_individual"] is None:
+            self.best_individual = None
+        else:
+            best_individual = np.array(state["best_individual"], dtype=float)
+            if best_individual.size != self.gene_length:
+                raise ValueError("Best individual shape mismatch in checkpoint")
+            self.best_individual = best_individual
+        self.best_fitness = _as_float(state["best_fitness"])
+        self.generation = _as_int(state["generation"])
+        self.fitness_history = [_as_float(v) for v in _as_list(state.get("fitness_history", []))]
 
     def save(self, path: str) -> None:
         checkpoint = Path(path)
@@ -476,21 +544,26 @@ class QLearning:
         }
 
     def load_state_dict(self, state: Dict[str, object]) -> None:
-        if state.get("version") != MODEL_STATE_VERSION:
+        if state.get("version") not in {1, MODEL_STATE_VERSION}:
             raise ValueError("Unsupported QLearning checkpoint version")
-        if int(state["state_window"]) != self.state_window:
+        if _as_int(state["state_window"]) != self.state_window:
             raise ValueError("State window mismatch in checkpoint")
 
-        self.lr = float(state["learning_rate"])
-        self.gamma = float(state["discount"])
-        self.epsilon = float(state["epsilon"])
-        self.epsilon_decay = float(state["epsilon_decay"])
-        self.epsilon_min = float(state["epsilon_min"])
-        self.q_table = dict(state["q_table"])
-        self.total_steps = int(state["total_steps"])
-        self.total_reward = float(state["total_reward"])
-        self.correct_predictions = int(state["correct_predictions"])
-        self.reward_history = [float(v) for v in state.get("reward_history", [])]
+        self.lr = _as_float(state["learning_rate"])
+        self.gamma = _as_float(state["discount"])
+        self.epsilon = _as_float(state["epsilon"])
+        self.epsilon_decay = _as_float(state["epsilon_decay"])
+        self.epsilon_min = _as_float(state["epsilon_min"])
+
+        q_table_data = _as_dict(state["q_table"])
+        self.q_table = {
+            cast(Tuple[State, int], key): _as_float(value)
+            for key, value in q_table_data.items()
+        }
+        self.total_steps = _as_int(state["total_steps"])
+        self.total_reward = _as_float(state["total_reward"])
+        self.correct_predictions = _as_int(state["correct_predictions"])
+        self.reward_history = [_as_float(v) for v in _as_list(state.get("reward_history", []))]
 
     def save(self, path: str) -> None:
         checkpoint = Path(path)
@@ -544,6 +617,11 @@ class LSTMPredictor:
         enc = {config.RESULT_LOSS: 0.0, config.RESULT_DRAW: 0.5, config.RESULT_WIN: 1.0}[outcome]
         return [enc, mun_g / 5.0, opp_g / 5.0]
 
+    def _goal_or_default(self, goals: List[Tuple[int, int]], index: int) -> Tuple[int, int]:
+        if 0 <= index < len(goals):
+            return goals[index]
+        return (0, 0)
+
     def train(self, outcomes: List[int], goals: List[Tuple[int, int]], epochs: int = 50) -> None:
         if len(outcomes) <= self.seq_length:
             return
@@ -551,7 +629,7 @@ class LSTMPredictor:
         X, y = [], []
         for i in range(len(outcomes) - self.seq_length):
             seq_X = [
-                self._step_feature(outcomes[j], goals[j][0], goals[j][1])
+                self._step_feature(outcomes[j], *self._goal_or_default(goals, j))
                 for j in range(i, i + self.seq_length)
             ]
             X.append(seq_X)
@@ -582,7 +660,7 @@ class LSTMPredictor:
             seq_X.append(self._step_feature(config.RESULT_DRAW, 0, 0)) # Default padding
         
         for i in range(start_idx, len(outcomes)):
-            seq_X.append(self._step_feature(outcomes[i], goals[i][0], goals[i][1]))
+            seq_X.append(self._step_feature(outcomes[i], *self._goal_or_default(goals, i)))
         
         with torch.no_grad():
             x_tensor = torch.tensor([seq_X], dtype=torch.float32)
@@ -603,13 +681,13 @@ class LSTMPredictor:
         }
 
     def load_state_dict(self, state: Dict[str, object]) -> None:
-        if state.get("version") != MODEL_STATE_VERSION:
+        if state.get("version") not in {1, MODEL_STATE_VERSION}:
             raise ValueError("Unsupported LSTMPredictor checkpoint version")
-        if int(state["seq_length"]) != self.seq_length or int(state["input_size"]) != self.input_size:
+        if _as_int(state["seq_length"]) != self.seq_length or _as_int(state["input_size"]) != self.input_size:
             raise ValueError("LSTM configuration mismatch in checkpoint")
 
-        self.model.load_state_dict(state["model_state_dict"])
-        self.optimizer.load_state_dict(state["optimizer_state_dict"])
+        self.model.load_state_dict(cast(Mapping[str, Any], _as_dict(state["model_state_dict"])))
+        self.optimizer.load_state_dict(cast(Dict[str, Any], _as_dict(state["optimizer_state_dict"])))
 
     def save(self, path: str) -> None:
         checkpoint = Path(path)
@@ -652,12 +730,26 @@ class BetpawaAI:
         }
 
     def load_state_dict(self, state: Dict[str, object]) -> None:
-        if state.get("version") != MODEL_STATE_VERSION:
+        version = state.get("version")
+        if version not in {1, MODEL_STATE_VERSION}:
             raise ValueError("Unsupported BetpawaAI checkpoint version")
 
-        self.ga.load_state_dict(state["ga"])
-        self.ql.load_state_dict(state["ql"])
-        self.lstm.load_state_dict(state["lstm"])
+        if version == MODEL_STATE_VERSION:
+            self.ga.load_state_dict(_as_dict(state["ga"]))
+            self.ql.load_state_dict(_as_dict(state["ql"]))
+            self.lstm.load_state_dict(_as_dict(state["lstm"]))
+            return
+
+        # Legacy checkpoints may contain GA weights that are incompatible with
+        # the current feature layout. Restore Q-learning and LSTM state, and
+        # keep the freshly initialised GA if the old GA block cannot load.
+        try:
+            self.ga.load_state_dict(_as_dict(state["ga"]))
+        except Exception as exc:
+            logger.warning("Skipping legacy GA checkpoint: %s", exc)
+
+        self.ql.load_state_dict(_as_dict(state["ql"]))
+        self.lstm.load_state_dict(_as_dict(state["lstm"]))
 
     def save(self, path: Optional[str] = None) -> bool:
         checkpoint_path = path or self.checkpoint_path
@@ -669,6 +761,29 @@ class BetpawaAI:
         with checkpoint.open("wb") as handle:
             pickle.dump(self.state_dict(), handle, protocol=pickle.HIGHEST_PROTOCOL)
         return True
+
+    def checkpoint_exists(self, path: Optional[str] = None) -> bool:
+        checkpoint_path = path or self.checkpoint_path
+        if not checkpoint_path:
+            return False
+        return Path(checkpoint_path).exists()
+
+    def checkpoint_info(self, path: Optional[str] = None) -> Dict[str, object]:
+        checkpoint_path = path or self.checkpoint_path
+        if not checkpoint_path:
+            return {
+                "exists": False,
+                "path": None,
+                "size_bytes": 0,
+            }
+
+        checkpoint = Path(checkpoint_path)
+        exists = checkpoint.exists()
+        return {
+            "exists": exists,
+            "path": str(checkpoint),
+            "size_bytes": checkpoint.stat().st_size if exists else 0,
+        }
 
     def load(self, path: Optional[str] = None) -> bool:
         checkpoint_path = path or self.checkpoint_path
@@ -708,7 +823,8 @@ class BetpawaAI:
         self.ga.train(outcomes, goals, generations=ga_generations, callback=ga_callback)
 
         logger.info("Training Q-Learning agent …")
-        self.ql.train(outcomes, callback=ql_callback)
+        for _ in range(3):
+            self.ql.train(outcomes, callback=ql_callback)
 
         logger.info("Training LSTM agent …")
         epochs = lstm_epochs or getattr(config, "LSTM_EPOCHS", 50)

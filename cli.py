@@ -190,6 +190,45 @@ def cmd_train(args, db: DataManager) -> None:
     print(f"    Q-table size: {summary['ql_q_table_size']}")
 
 
+def cmd_save_ai(args, db: DataManager) -> None:
+    """Save the current AI checkpoint to disk."""
+    _print_header("Betpawa AI — Save Checkpoint")
+    ai = BetpawaAI()
+    if ai.save():
+        print(_c(f"  Saved checkpoint to {ai.checkpoint_path}", _GREEN))
+    else:
+        print(_c("  No checkpoint path configured.", _YELLOW))
+
+
+def cmd_load_ai(args, db: DataManager) -> None:
+    """Load the AI checkpoint from disk."""
+    _print_header("Betpawa AI — Load Checkpoint")
+    ai = BetpawaAI(auto_load=False)
+    if ai.load():
+        summary = ai.summary()
+        print(_c(f"  Loaded checkpoint from {ai.checkpoint_path}", _GREEN))
+        print(f"  GA generation: {summary['ga_generation']}")
+        print(f"  QL steps:      {summary['ql_steps']}")
+        print(f"  Checkpoint size: {ai.checkpoint_info()['size_bytes']} bytes")
+    else:
+        print(_c("  No checkpoint found or load failed.", _YELLOW))
+
+
+def cmd_checkpoint_status(args, db: DataManager) -> None:
+    """Show the current checkpoint status."""
+    _print_header("Betpawa AI — Checkpoint Status")
+    ai = BetpawaAI(auto_load=False)
+    info = ai.checkpoint_info()
+    if info["exists"]:
+        print(_c("  Checkpoint: present", _GREEN))
+        print(f"  Path      : {info['path']}")
+        print(f"  Size      : {info['size_bytes']} bytes")
+    else:
+        print(_c("  Checkpoint: missing", _YELLOW))
+        if info["path"]:
+            print(f"  Path      : {info['path']}")
+
+
 def cmd_predict(args, db: DataManager) -> None:
     """Predict the next MUN match outcome."""
     _print_header("Betpawa AI — Prediction")
@@ -346,6 +385,11 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Number of GA generations (default: {config.GA_GENERATIONS})",
     )
 
+    # save/load/status checkpoints
+    sub.add_parser("save-ai", help="Save the current AI checkpoint to disk")
+    sub.add_parser("load-ai", help="Load the AI checkpoint from disk")
+    sub.add_parser("checkpoint-status", help="Show AI checkpoint status")
+
     # predict
     sub.add_parser("predict", help="Predict the next MUN match outcome")
 
@@ -402,6 +446,9 @@ def main(argv: List[str] = None) -> int:
         "upcoming": cmd_upcoming,
         "backfill": cmd_backfill,
         "status": cmd_status,
+        "save-ai": cmd_save_ai,
+        "load-ai": cmd_load_ai,
+        "checkpoint-status": cmd_checkpoint_status,
     }
 
     handler = handlers.get(args.command)

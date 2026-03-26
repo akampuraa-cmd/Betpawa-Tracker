@@ -259,8 +259,8 @@ class TestDataManager(unittest.TestCase):
 class TestFeatureEngineering(unittest.TestCase):
 
     def test_feature_size(self):
-        self.assertEqual(_feature_size(5), 14)   # 5*2 + 4
-        self.assertEqual(_feature_size(3), 10)   # 3*2 + 4
+        self.assertEqual(_feature_size(5), 24)   # 5*4 + 4
+        self.assertEqual(_feature_size(3), 16)   # 3*4 + 4
 
     def test_build_features_shape(self):
         w = 5
@@ -280,9 +280,30 @@ class TestFeatureEngineering(unittest.TestCase):
         outcomes = [config.RESULT_WIN] * w
         goals = [(1, 0)] * w
         feats = _build_features(outcomes, goals, w)
-        # win_rate is index w*2 + 2 = 12 for w=5
-        win_rate_idx = w * 2 + 2
+        # win_rate is after the one-hot outcomes and goal series
+        win_rate_idx = w * 4 + 2
         self.assertAlmostEqual(feats[win_rate_idx], 1.0)
+
+    def test_build_features_includes_odds_flag(self):
+        feats = _build_features(
+            [config.RESULT_WIN],
+            [(2, 1)],
+            window=1,
+            odds=(2.5, 3.0, 2.9),
+            include_odds=True,
+        )
+        self.assertEqual(feats.shape, (_feature_size(1, include_odds=True),))
+        self.assertEqual(feats[-4], 1.0)
+
+    def test_build_features_missing_odds_flag(self):
+        feats = _build_features(
+            [config.RESULT_WIN],
+            [(2, 1)],
+            window=1,
+            odds=None,
+            include_odds=True,
+        )
+        self.assertEqual(feats[-4], 0.0)
 
 
 class TestGeneticAlgorithm(unittest.TestCase):
@@ -412,6 +433,27 @@ class TestModelPersistence(unittest.TestCase):
         self.assertEqual(restored.summary()["ql_steps"], original["ql_steps"])
         self.assertEqual(restored.summary()["ql_q_table_size"], original["ql_q_table_size"])
 
+    def test_legacy_checkpoint_restores_non_ga_state(self):
+        random.seed(321)
+        outcomes = [random.choice([0, 1, 2]) for _ in range(12)]
+        goals = [(random.randint(0, 3), random.randint(0, 3)) for _ in range(12)]
+
+        ai = BetpawaAI(checkpoint_path=self._tmpfile.name, auto_load=False)
+        ai.train(outcomes, goals, ga_generations=1, lstm_epochs=1)
+
+        legacy_state = ai.state_dict()
+        legacy_state["version"] = 1
+        legacy_state["ga"]["version"] = 1
+
+        with open(self._tmpfile.name, "wb") as handle:
+            pickle.dump(legacy_state, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+        restored = BetpawaAI(checkpoint_path=self._tmpfile.name, auto_load=True)
+        self.assertEqual(restored.ql.total_steps, ai.ql.total_steps)
+        self.assertEqual(restored.ql.epsilon, ai.ql.epsilon)
+        self.assertEqual(restored.ql.q_table, ai.ql.q_table)
+        self.assertEqual(restored.ga.generation, 0)
+
 
 # ── CLI argument parsing ───────────────────────────────────────────────────────
 
@@ -469,6 +511,18 @@ class TestCLIParser(unittest.TestCase):
     def test_status_command(self):
         args = self._parse(["status"])
         self.assertEqual(args.command, "status")
+
+    def test_save_ai_command(self):
+        args = self._parse(["save-ai"])
+        self.assertEqual(args.command, "save-ai")
+
+    def test_load_ai_command(self):
+        args = self._parse(["load-ai"])
+        self.assertEqual(args.command, "load-ai")
+
+    def test_checkpoint_status_command(self):
+        args = self._parse(["checkpoint-status"])
+        self.assertEqual(args.command, "checkpoint-status")
 
     def test_no_command_raises(self):
         with self.assertRaises(SystemExit):

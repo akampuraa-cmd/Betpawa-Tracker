@@ -131,6 +131,12 @@ class BetpawaTrackerGUI:
             bg=BG_MID, fg=FG_PURPLE, font=FONT_SMALL,
         ).pack(anchor="w", padx=8, pady=(0, 4))
 
+        self.checkpoint_status_var = tk.StringVar(value="Checkpoint: Unknown")
+        tk.Label(
+            frame, textvariable=self.checkpoint_status_var,
+            bg=BG_MID, fg=FG_BLUE, font=FONT_SMALL,
+        ).pack(anchor="w", padx=8, pady=(0, 4))
+
         self.backfill_progress_var = tk.DoubleVar(value=0.0)
         self.backfill_progress = ttk.Progressbar(
             frame,
@@ -193,6 +199,8 @@ class BetpawaTrackerGUI:
         btn_row.pack(pady=6)
         self._btn(btn_row, "🧬 Train AI", FG_BLUE, self._train_ai).pack(side=tk.LEFT, padx=4)
         self._btn(btn_row, "🔮 Predict", FG_PURPLE, self._predict).pack(side=tk.LEFT, padx=4)
+        self._btn(btn_row, "💾 Save", FG_GREEN, self._save_ai).pack(side=tk.LEFT, padx=4)
+        self._btn(btn_row, "↻ Reload", FG_YELLOW, self._reload_ai).pack(side=tk.LEFT, padx=4)
 
     # ── Results table ─────────────────────────────────────────────────────────
 
@@ -561,6 +569,32 @@ class BetpawaTrackerGUI:
         if summary["ql_steps"] > 0:
             self.ql_acc_var.set(f"Accuracy: {summary['ql_accuracy']:.2%}")
         self.ql_eps_var.set(f"ε = {summary['ql_epsilon']:.3f}")
+
+        checkpoint_info = self.ai.checkpoint_info()
+        if checkpoint_info["exists"]:
+            self.checkpoint_status_var.set(
+                f"Checkpoint: Saved ({checkpoint_info['size_bytes']} bytes)"
+            )
+        else:
+            self.checkpoint_status_var.set("Checkpoint: Missing")
+
+    def _save_ai(self) -> None:
+        if self.ai.save():
+            info = self.ai.checkpoint_info()
+            self._append_log(f"💾 Saved AI checkpoint to {info['path']}")
+            self._refresh_stats()
+        else:
+            self._append_log("⚠  No checkpoint path configured.")
+
+    def _reload_ai(self) -> None:
+        if self.ai.load():
+            summary = self.ai.summary()
+            self._append_log(
+                f"↻ Reloaded AI checkpoint | GA gen {summary['ga_generation']} | QL steps {summary['ql_steps']}"
+            )
+            self._refresh_stats()
+        else:
+            self._append_log("⚠  No checkpoint found or load failed.")
 
     def _refresh_countdown(self) -> None:
         if self.scheduler and self.scheduler.is_running():

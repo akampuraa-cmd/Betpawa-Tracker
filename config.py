@@ -44,28 +44,28 @@ DATABASE_PATH = "betpawa_tracker.db"
 MODEL_CHECKPOINT_PATH = "betpawa_ai_checkpoint.pkl"
 
 # ── AI – Genetic Algorithm ───────────────────────────────────────────────────
-GA_POPULATION_SIZE = 50
-GA_GENERATIONS = 100
+GA_POPULATION_SIZE = 200
+GA_GENERATIONS = 500
 GA_MUTATION_RATE = 0.1
 GA_CROSSOVER_RATE = 0.7
 GA_ELITISM_COUNT = 5
 # Number of recent results used as features
-GA_FEATURE_WINDOW = 5
+GA_FEATURE_WINDOW = 10
 
 # ── AI – Q-Learning (Reinforcement Learning) ─────────────────────────────────
 QL_LEARNING_RATE = 0.1
 QL_DISCOUNT_FACTOR = 0.9
 QL_EPSILON = 0.2          # exploration rate (ε-greedy)
-QL_EPSILON_DECAY = 0.995
+QL_EPSILON_DECAY = 0.999
 QL_EPSILON_MIN = 0.01
 # State window: how many recent results to encode as the RL state
-QL_STATE_WINDOW = 3
+QL_STATE_WINDOW = 5
 
 # ── AI – LSTM ────────────────────────────────────────────────────────────────
-LSTM_SEQUENCE_LENGTH = 10
-LSTM_HIDDEN_SIZE = 32
+LSTM_SEQUENCE_LENGTH = 20
+LSTM_HIDDEN_SIZE = 64
 LSTM_NUM_LAYERS = 2
-LSTM_EPOCHS = 50
+LSTM_EPOCHS = 200
 LSTM_LEARNING_RATE = 0.005
 
 # ── Result encoding ──────────────────────────────────────────────────────────
