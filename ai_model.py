@@ -20,8 +20,10 @@ integers (0/1/2).  The agent picks an action (predicted outcome) using an
 """
 
 import math
+import pickle
 import random
 import logging
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -36,6 +38,7 @@ logger = logging.getLogger(__name__)
 # Action space: three possible predictions
 ACTIONS = [config.RESULT_LOSS, config.RESULT_DRAW, config.RESULT_WIN]
 N_ACTIONS = len(ACTIONS)
+MODEL_STATE_VERSION = 1
 
 
 # ── Feature engineering ───────────────────────────────────────────────────────
@@ -250,7 +253,7 @@ class GeneticAlgorithm:
         gen_best = fitnesses[best_idx]
         if gen_best >= self.best_fitness:
             self.best_fitness = gen_best
-            self.best_individual = self.population[0].copy()  # elitism preserves it
+            self.best_individual = self.population[0].copy()
 
         self.fitness_history.append(gen_best)
         return gen_best
@@ -275,6 +278,58 @@ class GeneticAlgorithm:
     def predict_next(self, outcomes: List[int], goals: List[Tuple[int, int]], odds: Optional[Tuple[float, float, float]] = None) -> int:
         feats = self.get_features(outcomes, goals, odds)
         return self.predict(feats)
+
+    def state_dict(self) -> Dict[str, object]:
+        return {
+            "version": MODEL_STATE_VERSION,
+            "population_size": self.population_size,
+            "generations": self.generations,
+            "mutation_rate": self.mutation_rate,
+            "crossover_rate": self.crossover_rate,
+            "elitism": self.elitism,
+            "feature_window": self.feature_window,
+            "include_odds": self.include_odds,
+            "n_features": self.n_features,
+            "gene_length": self.gene_length,
+            "population": [ind.copy() for ind in self.population],
+            "best_individual": None if self.best_individual is None else self.best_individual.copy(),
+            "best_fitness": self.best_fitness,
+            "generation": self.generation,
+            "fitness_history": list(self.fitness_history),
+        }
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        if state.get("version") != MODEL_STATE_VERSION:
+            raise ValueError("Unsupported GeneticAlgorithm checkpoint version")
+        if int(state["population_size"]) != self.population_size:
+            raise ValueError("Population size mismatch in checkpoint")
+        if int(state["feature_window"]) != self.feature_window or bool(state["include_odds"]) != self.include_odds:
+            raise ValueError("Feature configuration mismatch in checkpoint")
+
+        population = [np.array(ind, dtype=float) for ind in state["population"]]
+        if not population:
+            raise ValueError("Checkpoint does not contain a population")
+
+        self.population = population
+        self.best_individual = None if state["best_individual"] is None else np.array(state["best_individual"], dtype=float)
+        self.best_fitness = float(state["best_fitness"])
+        self.generation = int(state["generation"])
+        self.fitness_history = [float(v) for v in state.get("fitness_history", [])]
+
+    def save(self, path: str) -> None:
+        checkpoint = Path(path)
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        with checkpoint.open("wb") as handle:
+            pickle.dump(self.state_dict(), handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def load(self, path: str) -> bool:
+        checkpoint = Path(path)
+        if not checkpoint.exists():
+            return False
+        with checkpoint.open("rb") as handle:
+            state = pickle.load(handle)
+        self.load_state_dict(state)
+        return True
 
 
 # ── Q-Learning ────────────────────────────────────────────────────────────────
@@ -404,6 +459,54 @@ class QLearning:
             return 0.0
         return self.correct_predictions / self.total_steps
 
+    def state_dict(self) -> Dict[str, object]:
+        return {
+            "version": MODEL_STATE_VERSION,
+            "learning_rate": self.lr,
+            "discount": self.gamma,
+            "epsilon": self.epsilon,
+            "epsilon_decay": self.epsilon_decay,
+            "epsilon_min": self.epsilon_min,
+            "state_window": self.state_window,
+            "q_table": dict(self.q_table),
+            "total_steps": self.total_steps,
+            "total_reward": self.total_reward,
+            "correct_predictions": self.correct_predictions,
+            "reward_history": list(self.reward_history),
+        }
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        if state.get("version") != MODEL_STATE_VERSION:
+            raise ValueError("Unsupported QLearning checkpoint version")
+        if int(state["state_window"]) != self.state_window:
+            raise ValueError("State window mismatch in checkpoint")
+
+        self.lr = float(state["learning_rate"])
+        self.gamma = float(state["discount"])
+        self.epsilon = float(state["epsilon"])
+        self.epsilon_decay = float(state["epsilon_decay"])
+        self.epsilon_min = float(state["epsilon_min"])
+        self.q_table = dict(state["q_table"])
+        self.total_steps = int(state["total_steps"])
+        self.total_reward = float(state["total_reward"])
+        self.correct_predictions = int(state["correct_predictions"])
+        self.reward_history = [float(v) for v in state.get("reward_history", [])]
+
+    def save(self, path: str) -> None:
+        checkpoint = Path(path)
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        with checkpoint.open("wb") as handle:
+            pickle.dump(self.state_dict(), handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def load(self, path: str) -> bool:
+        checkpoint = Path(path)
+        if not checkpoint.exists():
+            return False
+        with checkpoint.open("rb") as handle:
+            state = pickle.load(handle)
+        self.load_state_dict(state)
+        return True
+
 
 # ── LSTM ──────────────────────────────────────────────────────────────────────
 
@@ -490,6 +593,39 @@ class LSTMPredictor:
             
         return ACTIONS[pred], conf
 
+    def state_dict(self) -> Dict[str, object]:
+        return {
+            "version": MODEL_STATE_VERSION,
+            "seq_length": self.seq_length,
+            "input_size": self.input_size,
+            "model_state_dict": self.model.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+        }
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        if state.get("version") != MODEL_STATE_VERSION:
+            raise ValueError("Unsupported LSTMPredictor checkpoint version")
+        if int(state["seq_length"]) != self.seq_length or int(state["input_size"]) != self.input_size:
+            raise ValueError("LSTM configuration mismatch in checkpoint")
+
+        self.model.load_state_dict(state["model_state_dict"])
+        self.optimizer.load_state_dict(state["optimizer_state_dict"])
+
+    def save(self, path: str) -> None:
+        checkpoint = Path(path)
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        with checkpoint.open("wb") as handle:
+            pickle.dump(self.state_dict(), handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def load(self, path: str) -> bool:
+        checkpoint = Path(path)
+        if not checkpoint.exists():
+            return False
+        with checkpoint.open("rb") as handle:
+            state = pickle.load(handle)
+        self.load_state_dict(state)
+        return True
+
 
 # ── Combined AI interface ─────────────────────────────────────────────────────
 
@@ -498,10 +634,61 @@ class BetpawaAI:
     Convenience wrapper combining the GA, Q-Learning, and LSTM models.
     """
 
-    def __init__(self):
+    def __init__(self, checkpoint_path: Optional[str] = None, auto_load: bool = True):
+        self.checkpoint_path = checkpoint_path or getattr(config, "MODEL_CHECKPOINT_PATH", None)
         self.ga = GeneticAlgorithm(include_odds=True)
         self.ql = QLearning()
         self.lstm = LSTMPredictor()
+
+        if auto_load:
+            self.load()
+
+    def state_dict(self) -> Dict[str, object]:
+        return {
+            "version": MODEL_STATE_VERSION,
+            "ga": self.ga.state_dict(),
+            "ql": self.ql.state_dict(),
+            "lstm": self.lstm.state_dict(),
+        }
+
+    def load_state_dict(self, state: Dict[str, object]) -> None:
+        if state.get("version") != MODEL_STATE_VERSION:
+            raise ValueError("Unsupported BetpawaAI checkpoint version")
+
+        self.ga.load_state_dict(state["ga"])
+        self.ql.load_state_dict(state["ql"])
+        self.lstm.load_state_dict(state["lstm"])
+
+    def save(self, path: Optional[str] = None) -> bool:
+        checkpoint_path = path or self.checkpoint_path
+        if not checkpoint_path:
+            return False
+
+        checkpoint = Path(checkpoint_path)
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        with checkpoint.open("wb") as handle:
+            pickle.dump(self.state_dict(), handle, protocol=pickle.HIGHEST_PROTOCOL)
+        return True
+
+    def load(self, path: Optional[str] = None) -> bool:
+        checkpoint_path = path or self.checkpoint_path
+        if not checkpoint_path:
+            return False
+
+        checkpoint = Path(checkpoint_path)
+        if not checkpoint.exists():
+            return False
+
+        try:
+            with checkpoint.open("rb") as handle:
+                state = pickle.load(handle)
+            self.load_state_dict(state)
+        except Exception as exc:
+            logger.warning("Could not load AI checkpoint from %s: %s", checkpoint, exc)
+            return False
+
+        logger.info("Loaded AI checkpoint from %s", checkpoint)
+        return True
 
     def train(
         self,
@@ -526,6 +713,8 @@ class BetpawaAI:
         logger.info("Training LSTM agent …")
         epochs = lstm_epochs or getattr(config, "LSTM_EPOCHS", 50)
         self.lstm.train(outcomes, goals, epochs=epochs)
+
+        self.save()
 
     def predict(
         self,

@@ -76,6 +76,10 @@ class DataManager:
                 conn.execute(
                     "ALTER TABLE results ADD COLUMN source TEXT NOT NULL DEFAULT 'live'"
                 )
+            if "season_id" not in columns:
+                conn.execute("ALTER TABLE results ADD COLUMN season_id INTEGER")
+            if "matchday" not in columns:
+                conn.execute("ALTER TABLE results ADD COLUMN matchday INTEGER")
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -97,6 +101,8 @@ class DataManager:
         raw_result: str,
         source: str = "live",
         deduplicate: bool = True,
+        season_id: Optional[int] = None,
+        matchday: Optional[int] = None,
     ) -> Optional[int]:
         """
         Persist a match result.
@@ -122,7 +128,7 @@ class DataManager:
         now = datetime.now(timezone.utc).isoformat()
 
         with self._lock, self._connect() as conn:
-            if deduplicate:
+            if deduplicate and source == "live":
                 # Live scraping revisits the same fixture several times while
                 # scores are updating. Keep dedup on for that path only.
                 existing = conn.execute(
@@ -139,13 +145,25 @@ class DataManager:
                 if existing:
                     return None
 
+            if source == "historical" and season_id is not None and matchday is not None:
+                existing_historical = conn.execute(
+                    """
+                    SELECT id FROM results
+                    WHERE season_id = ? AND matchday = ? AND team_home = ? AND team_away = ? AND source = 'historical'
+                    LIMIT 1
+                    """,
+                    (season_id, matchday, team_home, team_away)
+                ).fetchone()
+                if existing_historical:
+                    return None
+
             cursor = conn.execute(
                 """
                 INSERT INTO results
                     (timestamp, team_home, team_away,
                      ht_home, ht_away, ft_home, ft_away,
-                     mun_goals, opp_goals, outcome, raw_result, source)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     mun_goals, opp_goals, outcome, raw_result, source, season_id, matchday)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     now,
@@ -160,6 +178,8 @@ class DataManager:
                     outcome,
                     raw_result,
                     source,
+                    season_id,
+                    matchday,
                 ),
             )
             return cursor.lastrowid

@@ -460,6 +460,8 @@ def run_historical_backfill(
                         raw_result=fixture["raw_result"],
                         source="historical",
                         deduplicate=False,
+                        season_id=season_id,
+                        matchday=matchday,
                     )
                     if row_id:
                         inserted += 1

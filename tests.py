@@ -14,6 +14,7 @@ import math
 import random
 import tempfile
 import unittest
+import pickle
 
 # Add the project root to sys.path so imports resolve
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -382,6 +383,34 @@ class TestBetpawaAI(unittest.TestCase):
         ai = BetpawaAI()
         # Should not raise even with 1 data point
         ai.train([config.RESULT_WIN], [(2, 0)])
+
+
+class TestModelPersistence(unittest.TestCase):
+
+    def setUp(self):
+        self._tmpfile = tempfile.NamedTemporaryFile(suffix=".pkl", delete=False)
+        self._tmpfile.close()
+
+    def tearDown(self):
+        try:
+            os.unlink(self._tmpfile.name)
+        except PermissionError:
+            pass
+
+    def test_ai_save_and_load_round_trip(self):
+        random.seed(123)
+        outcomes = [random.choice([0, 1, 2]) for _ in range(12)]
+        goals = [(random.randint(0, 3), random.randint(0, 3)) for _ in range(12)]
+
+        ai = BetpawaAI(checkpoint_path=self._tmpfile.name, auto_load=False)
+        ai.train(outcomes, goals, ga_generations=2, lstm_epochs=1)
+        original = ai.summary()
+        self.assertTrue(ai.save())
+
+        restored = BetpawaAI(checkpoint_path=self._tmpfile.name, auto_load=True)
+        self.assertEqual(restored.summary()["ga_generation"], original["ga_generation"])
+        self.assertEqual(restored.summary()["ql_steps"], original["ql_steps"])
+        self.assertEqual(restored.summary()["ql_q_table_size"], original["ql_q_table_size"])
 
 
 # ── CLI argument parsing ───────────────────────────────────────────────────────

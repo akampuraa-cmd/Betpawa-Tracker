@@ -40,6 +40,9 @@ HISTORICAL_MATCHDAYS = 38
 # ── Database ─────────────────────────────────────────────────────────────────
 DATABASE_PATH = "betpawa_tracker.db"
 
+# ── AI persistence ──────────────────────────────────────────────────────────
+MODEL_CHECKPOINT_PATH = "betpawa_ai_checkpoint.pkl"
+
 # ── AI – Genetic Algorithm ───────────────────────────────────────────────────
 GA_POPULATION_SIZE = 50
 GA_GENERATIONS = 100
