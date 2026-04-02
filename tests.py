@@ -15,12 +15,23 @@ import random
 import tempfile
 import unittest
 import pickle
+from unittest import mock
+
+from selenium.common.exceptions import WebDriverException
 
 # Add the project root to sys.path so imports resolve
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-from scraper import parse_result, _parse_row, parse_matchday_text
+from scraper import (
+    PageFetchError,
+    _dedupe_text_rows,
+    _load_page_with_retries,
+    _parse_candidate_rows,
+    _parse_row,
+    parse_matchday_text,
+    parse_result,
+)
 from data_manager import DataManager
 from ai_model import (
     _build_features,
@@ -30,6 +41,20 @@ from ai_model import (
     BetpawaAI,
 )
 import cli as cli_module
+
+
+class _FakeDriver:
+
+    def __init__(self, get_side_effects=None):
+        self.get_side_effects = list(get_side_effects or [])
+        self.get_calls = []
+
+    def get(self, url):
+        self.get_calls.append(url)
+        if self.get_side_effects:
+            effect = self.get_side_effects.pop(0)
+            if effect is not None:
+                raise effect
 
 
 # ── Result parsing ─────────────────────────────────────────────────────────────
@@ -105,6 +130,96 @@ class TestParseMatchdayText(unittest.TestCase):
     def test_returns_empty_when_team_not_present(self):
         text = "ARS - WHU (2 - 0)2 - 1 TOT - BRE (0 - 0)0 - 1"
         self.assertEqual(parse_matchday_text(text), [])
+
+
+class TestScraperHardening(unittest.TestCase):
+
+    def test_dedupe_text_rows_normalizes_duplicates(self):
+        rows = [
+            " MUN  ARS (1 - 0)2 - 0 ",
+            "MUN ARS (1 - 0)2 - 0",
+            "\nMUN   ARS   (1 - 0)2 - 0\n",
+        ]
+        self.assertEqual(_dedupe_text_rows(rows), ["MUN ARS (1 - 0)2 - 0"])
+
+    def test_parse_candidate_rows_discards_invalid_and_duplicate_candidates(self):
+        candidates = [
+            "MUN ARS (1 - 0)2 - 0",
+            "MUN    ARS    (1 - 0)2 - 0",
+            "MUN vs ARS",
+        ]
+
+        rows = _parse_candidate_rows(
+            candidates,
+            body_text="MUN scoreboard",
+            page_name="Test page",
+        )
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["team_home"], "MUN")
+        self.assertEqual(rows[0]["ft_home"], 2)
+        self.assertEqual(rows[0]["ft_away"], 0)
+
+    def test_load_page_with_retries_retries_until_required_text_is_present(self):
+        driver = _FakeDriver()
+
+        with mock.patch(
+            "scraper._wait_for_rendered_body_text",
+            side_effect=["Loading...", "Season #123"],
+        ), mock.patch("scraper.time.sleep") as sleep_mock:
+            body_text = _load_page_with_retries(
+                driver,
+                "https://example.test/results",
+                required_text="Season #",
+                min_length=5,
+                attempts=2,
+                retry_delay=0.01,
+                page_name="Results page",
+            )
+
+        self.assertEqual(body_text, "Season #123")
+        self.assertEqual(len(driver.get_calls), 2)
+        sleep_mock.assert_called_once()
+
+    def test_load_page_with_retries_recovers_from_transient_webdriver_error(self):
+        driver = _FakeDriver(get_side_effects=[WebDriverException("boom"), None])
+
+        with mock.patch(
+            "scraper._wait_for_rendered_body_text",
+            return_value="Season #456",
+        ), mock.patch("scraper.time.sleep"):
+            body_text = _load_page_with_retries(
+                driver,
+                "https://example.test/results",
+                required_text="Season #",
+                min_length=5,
+                attempts=2,
+                retry_delay=0,
+                page_name="Results page",
+            )
+
+        self.assertEqual(body_text, "Season #456")
+        self.assertEqual(len(driver.get_calls), 2)
+
+    def test_load_page_with_retries_raises_after_exhaustion(self):
+        driver = _FakeDriver()
+
+        with mock.patch(
+            "scraper._wait_for_rendered_body_text",
+            return_value="Loading...",
+        ), mock.patch("scraper.time.sleep"):
+            with self.assertRaises(PageFetchError):
+                _load_page_with_retries(
+                    driver,
+                    "https://example.test/results",
+                    required_text="Season #",
+                    min_length=5,
+                    attempts=2,
+                    retry_delay=0,
+                    page_name="Results page",
+                )
+
+        self.assertEqual(len(driver.get_calls), 2)
 
 
 # ── DataManager ───────────────────────────────────────────────────────────────
@@ -356,8 +471,10 @@ class TestQLearning(unittest.TestCase):
 
     def test_train_increments_steps(self):
         self.ql.train(self.outcomes)
-        # Should have trained on outcomes[3..29] = 27 steps
-        self.assertEqual(self.ql.total_steps, len(self.outcomes) - 3)
+        # Each replay pass trains on outcomes[3..29] = 27 steps
+        steps_per_pass = len(self.outcomes) - 3
+        expected = steps_per_pass * self.ql.replay_passes
+        self.assertEqual(self.ql.total_steps, expected)
 
     def test_q_table_populated(self):
         self.ql.train(self.outcomes)

@@ -140,6 +140,9 @@ python cli.py predict
 | `QL_LEARNING_RATE` | `0.1` | Q-learning α |
 | `QL_DISCOUNT_FACTOR` | `0.9` | Q-learning γ |
 | `QL_EPSILON` | `0.2` | Initial exploration rate |
+| `PAGE_FETCH_RETRIES` | `3` | Retries when a page renders partial or app-shell content |
+| `PAGE_FETCH_RETRY_DELAY_SECONDS` | `2` | Base delay between page-load retries |
+| `PAGE_FETCH_MIN_BODY_LENGTH` | `100` | Minimum rendered body length before parsing starts |
 | `HEADLESS` | `True` | Run Brave headless |
 
 ---
@@ -150,5 +153,5 @@ python cli.py predict
 python -m unittest tests -v
 ```
 
-45 unit tests covering result parsing, database CRUD, AI feature engineering,
+50 unit tests covering result parsing, database CRUD, AI feature engineering,
 GA/QL mechanics, and CLI argument parsing.

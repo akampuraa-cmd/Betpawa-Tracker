@@ -2,3 +2,4 @@ selenium>=4.15.0
 webdriver-manager>=4.0.0
 numpy>=1.26.0
 torch>=2.2.0
+flask>=3.0.0

@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Betpawa MUN Tracker</title>
+  <style>
+    :root {
+      --bg-dark: #1e1e2e;
+      --bg-mid: #2a2a3c;
+      --bg-light: #313145;
+      --fg: #cdd6f4;
+      --green: #a6e3a1;
+      --red: #f38ba8;
+      --yellow: #f9e2af;
+      --blue: #89b4fa;
+      --purple: #cba6f7;
+      --grey: #6c7086;
+      --font: "Consolas", "Cascadia Code", "Fira Code", ui-monospace, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: var(--font);
+      font-size: 14px;
+      background: var(--bg-dark);
+      color: var(--fg);
+      min-height: 100vh;
+    }
+    header {
+      text-align: center;
+      padding: 1rem;
+      color: var(--purple);
+      font-size: 1.25rem;
+      font-weight: bold;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      padding: 0 12px;
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+    @media (max-width: 900px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+    .panel {
+      background: var(--bg-mid);
+      border-radius: 8px;
+      padding: 12px 14px;
+    }
+    .panel h2 {
+      margin: 0 0 10px 0;
+      font-size: 0.95rem;
+      font-weight: bold;
+    }
+    .panel.scraper h2 { color: var(--blue); }
+    .panel.ai h2 { color: var(--purple); }
+    .stat { margin: 4px 0; font-size: 0.85rem; }
+    .stat.em { color: var(--green); font-weight: bold; }
+    .stat.warn { color: var(--yellow); }
+    .stat.sub { color: var(--grey); font-size: 0.8rem; }
+    .progress {
+      height: 8px;
+      background: var(--bg-light);
+      border-radius: 4px;
+      overflow: hidden;
+      margin-top: 8px;
+    }
+    .progress > div {
+      height: 100%;
+      background: var(--purple);
+      width: 0%;
+      transition: width 0.3s ease;
+    }
+    .btn-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    button {
+      font-family: var(--font);
+      font-size: 0.8rem;
+      padding: 8px 12px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      background: var(--bg-light);
+      color: var(--fg);
+    }
+    button:hover { filter: brightness(1.1); }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn-green { color: var(--green); }
+    .btn-red { color: var(--red); }
+    .btn-yellow { color: var(--yellow); }
+    .btn-blue { color: var(--blue); }
+    .btn-purple { color: var(--purple); }
+    .wide {
+      grid-column: 1 / -1;
+      max-width: 1200px;
+      margin: 12px auto;
+      padding: 0 12px;
+    }
+    .table-wrap {
+      overflow: auto;
+      max-height: 320px;
+      border-radius: 8px;
+      border: 1px solid var(--bg-light);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.8rem;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      background: var(--bg-mid);
+      color: var(--blue);
+      text-align: left;
+      padding: 8px 6px;
+    }
+    td { padding: 6px; border-bottom: 1px solid var(--bg-light); }
+    tr.win td:nth-child(7) { color: var(--green); }
+    tr.draw td:nth-child(7) { color: var(--yellow); }
+    tr.loss td:nth-child(7) { color: var(--red); }
+    tr.hist { background: rgba(203, 166, 247, 0.08); }
+    .log-box {
+      background: var(--bg-light);
+      color: var(--fg);
+      font-size: 0.78rem;
+      height: 180px;
+      overflow-y: auto;
+      padding: 8px;
+      border-radius: 8px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .subpanels { display: grid; gap: 8px; }
+    .subpanel {
+      background: rgba(0,0,0,0.15);
+      border-radius: 6px;
+      padding: 8px;
+    }
+    .subpanel h3 { margin: 0 0 6px 0; font-size: 0.8rem; color: var(--blue); }
+    .subpanel.ql h3 { color: var(--yellow); }
+    .prediction {
+      margin-top: 8px;
+      color: var(--purple);
+      font-weight: bold;
+      min-height: 1.4em;
+    }
+    .toolbar { display: flex; justify-content: flex-end; margin-bottom: 8px; }
+  </style>
+</head>
+<body>
+  <header>Betpawa MUN Virtual-Sports Tracker</header>
+
+  <div class="grid">
+    <section class="panel scraper">
+      <h2>Scraper</h2>
+      <div class="stat em" id="scraper-status">—</div>
+      <div class="stat warn" id="countdown"></div>
+      <div class="stat sub" id="totals"></div>
+      <div class="stat sub" id="backfill-label">—</div>
+      <div class="stat sub" id="checkpoint-label">—</div>
+      <div class="progress"><div id="backfill-bar"></div></div>
+      <div class="btn-row">
+        <button type="button" class="btn-green" id="btn-start">Start</button>
+        <button type="button" class="btn-red" id="btn-stop">Stop</button>
+        <button type="button" class="btn-yellow" id="btn-scrape">Scrape now</button>
+        <button type="button" class="btn-purple" id="btn-backfill">Backfill history</button>
+      </div>
+    </section>
+
+    <section class="panel ai">
+      <h2>AI (GA + Q-Learning + LSTM)</h2>
+      <div class="subpanels">
+        <div class="subpanel">
+          <h3>Genetic algorithm</h3>
+          <div class="stat sub" id="ga-gen">—</div>
+          <div class="stat sub" id="ga-fit">—</div>
+        </div>
+        <div class="subpanel ql">
+          <h3>Q-Learning</h3>
+          <div class="stat sub" id="ql-steps">—</div>
+          <div class="stat sub" id="ql-acc">—</div>
+          <div class="stat sub" id="ql-eps">—</div>
+        </div>
+      </div>
+      <div class="prediction" id="prediction">Prediction: —</div>
+      <div class="btn-row">
+        <button type="button" class="btn-blue" id="btn-train">Train AI</button>
+        <button type="button" class="btn-purple" id="btn-predict">Predict</button>
+        <button type="button" class="btn-green" id="btn-save">Save</button>
+        <button type="button" class="btn-yellow" id="btn-reload">Reload</button>
+      </div>
+    </section>
+  </div>
+
+  <div class="wide">
+    <section class="panel">
+      <div class="toolbar">
+        <button type="button" class="btn-red" id="btn-clear">Clear results</button>
+      </div>
+      <h2 style="color:var(--green);margin-top:0;">Recent results</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Time</th>
+              <th>Src</th>
+              <th>Home</th>
+              <th>FT</th>
+              <th>Away</th>
+              <th>Out</th>
+              <th>Raw</th>
+            </tr>
+          </thead>
+          <tbody id="results-body"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <div class="wide">
+    <section class="panel">
+      <h2 style="color:var(--grey);margin-top:0;">Backend log</h2>
+      <div class="log-box" id="log"></div>
+    </section>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    async function post(url) {
+      const r = await fetch(url, { method: 'POST', headers: { 'Accept': 'application/json' } });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.message || r.statusText);
+      return data;
+    }
+
+    function outcomeClass(o) {
+      if (o === 2) return 'win';
+      if (o === 1) return 'draw';
+      if (o === 0) return 'loss';
+      return '';
+    }
+
+    function renderResults(rows) {
+      const tb = $('results-body');
+      tb.innerHTML = rows.map((row) => {
+        const oc = outcomeClass(row.outcome);
+        const hs = row.source === 'historical' ? 'hist' : '';
+        const score = row.ft_home + ' - ' + row.ft_away;
+        return '<tr class="' + oc + ' ' + hs + '">' +
+          '<td>' + row.id + '</td>' +
+          '<td>' + escapeHtml(row.timestamp) + '</td>' +
+          '<td>' + escapeHtml(row.source) + '</td>' +
+          '<td>' + escapeHtml(row.team_home) + '</td>' +
+          '<td>' + escapeHtml(score) + '</td>' +
+          '<td>' + escapeHtml(row.team_away) + '</td>' +
+          '<td>' + escapeHtml(row.outcome_label) + '</td>' +
+          '<td>' + escapeHtml(row.raw_result) + '</td></tr>';
+      }).join('');
+    }
+
+    function escapeHtml(s) {
+      const d = document.createElement('div');
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    async function refreshStatus() {
+      const s = await fetch('/api/status').then((r) => r.json());
+      const sched = s.scheduler_running;
+      let statusText = s.scraper_label;
+      if (sched && s.countdown_seconds > 0) {
+        const m = Math.floor(s.countdown_seconds / 60);
+        const sec = s.countdown_seconds % 60;
+        $('countdown').textContent = 'Next scrape in ' + String(m).padStart(2,'0') + ':' + String(sec).padStart(2,'0');
+      } else if (sched && s.countdown_seconds === 0) {
+        $('countdown').textContent = 'Scraping in progress …';
+        statusText = 'Scraping';
+      } else {
+        $('countdown').textContent = '';
+      }
+      $('scraper-status').textContent = statusText + (sched ? ' ▶' : ' ■');
+      $('totals').textContent =
+        'Stored: ' + s.total_results +
+        ' | Live: ' + s.source_live +
+        ' | Historical: ' + s.source_historical;
+      $('backfill-label').textContent = s.backfill_status;
+      $('backfill-bar').style.width = (s.backfill_running ? s.backfill_progress : 0) + '%';
+      $('btn-backfill').disabled = s.backfill_running;
+
+      const ck = s.checkpoint_exists
+        ? ('Checkpoint: saved' + (s.checkpoint_size_bytes != null ? ' (' + s.checkpoint_size_bytes + ' B)' : ''))
+        : 'Checkpoint: missing';
+      $('checkpoint-label').textContent = ck;
+
+      $('ga-gen').textContent = 'Generation: ' + s.ga_generation;
+      const fit = s.ga_generation > 0 ? Number(s.ga_best_fitness).toFixed(4) : '—';
+      $('ga-fit').textContent = 'Best fitness: ' + fit;
+      $('ql-steps').textContent = 'Steps: ' + s.ql_steps;
+      $('ql-acc').textContent = s.ql_steps > 0 ? ('Accuracy: ' + (s.ql_accuracy * 100).toFixed(1) + '%') : 'Accuracy: —';
+      $('ql-eps').textContent = 'ε = ' + (s.ql_epsilon != null ? s.ql_epsilon.toFixed(3) : '—');
+      $('btn-train').disabled = s.training;
+      if (s.last_prediction) {
+        $('prediction').textContent = 'Prediction: ' + s.last_prediction;
+      }
+
+      const res = await fetch('/api/results?limit=50').then((r) => r.json());
+      renderResults(res.results || []);
+    }
+
+    async function refreshLogs() {
+      const j = await fetch('/api/logs?limit=400').then((r) => r.json());
+      const lines = j.lines || [];
+      $('log').textContent = lines.join('\n');
+      $('log').scrollTop = $('log').scrollHeight;
+    }
+
+    $('btn-start').onclick = () => post('/api/scheduler/start').then(refreshStatus).catch(alert);
+    $('btn-stop').onclick = () => post('/api/scheduler/stop').then(refreshStatus).catch(alert);
+    $('btn-scrape').onclick = () => post('/api/scrape').then(refreshStatus).catch(alert);
+    $('btn-backfill').onclick = () => {
+      if (!confirm('Import historical MUN results from Betpawa? This may take a few minutes.')) return;
+      post('/api/backfill').then(refreshStatus).catch(alert);
+    };
+    $('btn-train').onclick = () => post('/api/train').then(refreshStatus).catch(alert);
+    $('btn-predict').onclick = () => post('/api/predict').then((d) => {
+      if (d.consensus) $('prediction').textContent = 'Prediction: ' + d.consensus;
+      refreshStatus();
+    }).catch(alert);
+    $('btn-save').onclick = () => post('/api/save').then(refreshStatus).catch(alert);
+    $('btn-reload').onclick = () => post('/api/reload').then(refreshStatus).catch(alert);
+    $('btn-clear').onclick = () => {
+      if (!confirm('Delete all stored match results? This cannot be undone.')) return;
+      post('/api/clear-results').then(refreshStatus).catch(alert);
+    };
+
+    setInterval(refreshStatus, 1000);
+    setInterval(refreshLogs, 800);
+    refreshStatus();
+    refreshLogs();
+  </script>
+</body>
+</html>

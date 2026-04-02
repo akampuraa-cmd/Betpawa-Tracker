@@ -3,13 +3,15 @@ Entry point for the Betpawa Tracker application.
 
 Usage
 -----
-  python main.py              → launch the Tkinter GUI
+  python main.py              → launch the web dashboard (Flask)
+  python main.py --gui tk     → legacy Tkinter desktop GUI
   python main.py --cli <cmd>  → run a CLI command (see `python cli.py --help`)
   python main.py --help       → show help
 
 Examples
 --------
-  python main.py                          # GUI
+  python main.py                          # Web UI at http://127.0.0.1:5050/
+  python main.py --gui tk                 # Tkinter GUI
   python main.py --cli start              # CLI scheduler
   python main.py --cli scrape             # CLI one-shot scrape
   python main.py --cli results --count 10 # CLI show results
@@ -37,10 +39,29 @@ def main() -> int:
         prog="betpawa-tracker",
         description=(
             "Betpawa MUN Tracker — web scraper + AI\n\n"
-            "Run without arguments to launch the GUI.\n"
+            "Run without arguments to launch the web dashboard.\n"
             "Pass --cli <command> to use the command-line interface."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--gui",
+        choices=["web", "tk"],
+        default="web",
+        help="UI when not using --cli (default: web dashboard)",
+    )
+    parser.add_argument(
+        "--host",
+        default=None,
+        metavar="ADDR",
+        help="Web dashboard bind address (default: config WEB_HOST)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Web dashboard port (default: config WEB_PORT)",
     )
     parser.add_argument(
         "--cli",
@@ -60,19 +81,24 @@ def main() -> int:
         # Delegate to the CLI module
         import cli as cli_module
         return cli_module.main(args.cli)
+    elif args.gui == "web":
+        import web_app as web_app_module
+
+        web_app_module.run(host=args.host, port=args.port)
+        return 0
     else:
-        # Launch GUI
         try:
             import tkinter as tk  # noqa: F401 – just to check availability
         except ImportError:
             print(
                 "Tkinter is not available in this Python installation.\n"
-                "Install it (e.g., `sudo apt install python3-tk`) or use the "
-                "CLI mode: python main.py --cli --help"
+                "Use the web dashboard (default): python main.py\n"
+                "Or the CLI: python main.py --cli --help"
             )
             return 1
 
         import gui as gui_module
+
         gui_module.launch()
         return 0
 

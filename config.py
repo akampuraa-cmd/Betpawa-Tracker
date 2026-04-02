@@ -44,29 +44,43 @@ DATABASE_PATH = "betpawa_tracker.db"
 MODEL_CHECKPOINT_PATH = "betpawa_ai_checkpoint.pkl"
 
 # ── AI – Genetic Algorithm ───────────────────────────────────────────────────
-GA_POPULATION_SIZE = 200
-GA_GENERATIONS = 500
-GA_MUTATION_RATE = 0.1
-GA_CROSSOVER_RATE = 0.7
-GA_ELITISM_COUNT = 5
+GA_POPULATION_SIZE = 300
+GA_GENERATIONS = 800
+GA_MUTATION_RATE = 0.08
+GA_MUTATION_RATE_FLOOR = 0.005
+GA_MUTATION_RATE_CEILING = 0.30
+GA_EARLY_STOP_PATIENCE = 60
+GA_EARLY_STOP_MIN_DELTA = 0.00005
+GA_CROSSOVER_RATE = 0.75
+GA_ELITISM_COUNT = 10
 # Number of recent results used as features
-GA_FEATURE_WINDOW = 10
+GA_FEATURE_WINDOW = 15
 
 # ── AI – Q-Learning (Reinforcement Learning) ─────────────────────────────────
-QL_LEARNING_RATE = 0.1
-QL_DISCOUNT_FACTOR = 0.9
-QL_EPSILON = 0.2          # exploration rate (ε-greedy)
-QL_EPSILON_DECAY = 0.999
-QL_EPSILON_MIN = 0.01
+QL_LEARNING_RATE = 0.15
+QL_DISCOUNT_FACTOR = 0.95
+QL_EPSILON = 0.3          # exploration rate (ε-greedy) — higher start for broader exploration
+QL_EPSILON_DECAY = 0.9985
+QL_EPSILON_MIN = 0.005
+QL_REPLAY_PASSES = 5
+QL_REPLAY_MIN_TD_ERROR = 0.00005
+QL_REPLAY_EARLY_STOP_PATIENCE = 3
 # State window: how many recent results to encode as the RL state
-QL_STATE_WINDOW = 5
+QL_STATE_WINDOW = 4
 
 # ── AI – LSTM ────────────────────────────────────────────────────────────────
-LSTM_SEQUENCE_LENGTH = 20
-LSTM_HIDDEN_SIZE = 64
-LSTM_NUM_LAYERS = 2
-LSTM_EPOCHS = 200
-LSTM_LEARNING_RATE = 0.005
+LSTM_SEQUENCE_LENGTH = 25
+LSTM_HIDDEN_SIZE = 128
+LSTM_NUM_LAYERS = 3
+LSTM_EPOCHS = 400
+LSTM_LEARNING_RATE = 0.002
+LSTM_DROPOUT = 0.25
+LSTM_BATCH_SIZE = 16
+LSTM_VALIDATION_SPLIT = 0.15
+LSTM_EARLY_STOP_PATIENCE = 20
+LSTM_MIN_DELTA = 0.00005
+LSTM_LR_FACTOR = 0.5
+LSTM_LR_PATIENCE = 6
 
 # ── Result encoding ──────────────────────────────────────────────────────────
 # Maps a match result to a numeric label for the AI
@@ -80,8 +94,16 @@ RESULT_LABELS = {RESULT_WIN: "Win", RESULT_DRAW: "Draw", RESULT_LOSS: "Loss"}
 # ── Selenium ─────────────────────────────────────────────────────────────────
 # Seconds to wait for the page to load before starting to parse
 PAGE_LOAD_WAIT = 10
+# Retry navigation when Betpawa returns the app shell or a partial render.
+PAGE_FETCH_RETRIES = 3
+PAGE_FETCH_RETRY_DELAY_SECONDS = 2
+PAGE_FETCH_MIN_BODY_LENGTH = 100
 # Run browser in headless mode (no visible browser window)
 HEADLESS = True
 
 # Path to Brave browser binary (Chromium-based, uses ChromeDriver)
 BRAVE_BINARY_PATH = r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"
+
+# ── Web dashboard ────────────────────────────────────────────────────────────
+WEB_HOST = "127.0.0.1"
+WEB_PORT = 5050

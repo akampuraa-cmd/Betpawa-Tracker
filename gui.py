@@ -457,13 +457,20 @@ class BetpawaTrackerGUI:
             odds = (match['home_odds'], match['draw_odds'], match['away_odds'])
 
         result = self.ai.predict(outcomes, goals, odds)
+        ga_label = result.get('ga_label', 'N/A')
+        ga_conf = result.get('ga_confidence', 0.0)
+        ql_label = result.get('ql_label', 'N/A')
+        lstm_label = result.get('lstm_label', 'N/A')
+        lstm_conf = result.get('lstm_confidence', 0.0)
+        consensus = result.get('consensus_label', 'N/A')
+
         label = (
-            f"GA: {result['ga_label']} ({result['ga_confidence']:.0%}) | "
-            f"QL: {result['ql_label']} | "
-            f"LSTM: {result['lstm_label']} ({result['lstm_confidence']:.0%}) | "
-            f"Consensus: {result['consensus_label']}"
+            f"GA: {ga_label} ({ga_conf:.0%}) | "
+            f"QL: {ql_label} | "
+            f"LSTM: {lstm_label} ({lstm_conf:.0%}) | "
+            f"Consensus: {consensus}"
         )
-        self.prediction_var.set(f"🔮 {result['consensus_label']}")
+        self.prediction_var.set(f"🔮 {consensus}")
         self._append_log(f"Prediction → {label}")
 
     # ── Thread safety helpers ─────────────────────────────────────────────────
@@ -570,18 +577,18 @@ class BetpawaTrackerGUI:
             self.ql_acc_var.set(f"Accuracy: {summary['ql_accuracy']:.2%}")
         self.ql_eps_var.set(f"ε = {summary['ql_epsilon']:.3f}")
 
-        checkpoint_info = self.ai.checkpoint_info()
-        if checkpoint_info["exists"]:
-            self.checkpoint_status_var.set(
-                f"Checkpoint: Saved ({checkpoint_info['size_bytes']} bytes)"
-            )
+        checkpoint_info = self.ai.checkpoint_info() or {}
+        if checkpoint_info.get("exists", False):
+            size = checkpoint_info.get("size_bytes")
+            size_str = f" ({size} bytes)" if size is not None else ""
+            self.checkpoint_status_var.set(f"Checkpoint: Saved{size_str}")
         else:
             self.checkpoint_status_var.set("Checkpoint: Missing")
 
     def _save_ai(self) -> None:
         if self.ai.save():
-            info = self.ai.checkpoint_info()
-            self._append_log(f"💾 Saved AI checkpoint to {info['path']}")
+            info = self.ai.checkpoint_info() or {}
+            self._append_log(f"💾 Saved AI checkpoint to {info.get('path')}")
             self._refresh_stats()
         else:
             self._append_log("⚠  No checkpoint path configured.")

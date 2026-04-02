@@ -27,13 +27,15 @@ from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
-    NoSuchElementException,
     TimeoutException,
     WebDriverException,
 )
+
+try:
+    from webdriver_manager.chrome import ChromeDriverManager
+except Exception:
+    ChromeDriverManager = None
 
 import config
 from data_manager import DataManager
@@ -50,6 +52,38 @@ _MATCHDAY_FIXTURE_RE = re.compile(
     r"\(\s*(?P<ht_home>\d+)\s*-\s*(?P<ht_away>\d+)\s*\)\s*"
     r"(?P<ft_home>\d+)\s*-\s*(?P<ft_away>\d+)"
 )
+
+
+class PageFetchError(RuntimeError):
+    """Raised when a page cannot be loaded or validated after retries."""
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _dedupe_text_rows(rows: List[str]) -> List[str]:
+    unique_rows: List[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        normalized = _normalize_text(row)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_rows.append(normalized)
+    return unique_rows
+
+
+def _dedupe_records(records: List[dict], key_fields: Tuple[str, ...]) -> List[dict]:
+    unique_records: List[dict] = []
+    seen: set[Tuple[object, ...]] = set()
+    for record in records:
+        key = tuple(record.get(field) for field in key_fields)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_records.append(record)
+    return unique_records
 
 
 # ── Result parsing ────────────────────────────────────────────────────────────
@@ -83,10 +117,86 @@ def _build_driver() -> webdriver.Chrome:
     # Suppress ChromeDriver logs
     opts.add_experimental_option("excludeSwitches", ["enable-logging"])
 
-    service = Service()
-    driver = webdriver.Chrome(service=service, options=opts)
-    driver.set_page_load_timeout(30)
-    return driver
+    # Try using webdriver-manager if available to auto-download a compatible chromedriver
+    try:
+        if ChromeDriverManager is not None:
+            driver_path = ChromeDriverManager().install()
+            service = Service(driver_path)
+            logger.info("Using ChromeDriver from webdriver_manager: %s", driver_path)
+        else:
+            service = Service()
+
+        driver = webdriver.Chrome(service=service, options=opts)
+        driver.set_page_load_timeout(30)
+        return driver
+    except WebDriverException as exc:
+        logger.error("Failed to start WebDriver: %s", exc)
+        raise WebDriverException(
+            f"WebDriver failed to start. Check BRAVE_BINARY_PATH ({config.BRAVE_BINARY_PATH}) and ChromeDriver availability. Original error: {exc}"
+        ) from exc
+
+
+def _load_page_with_retries(
+    driver: webdriver.Chrome,
+    url: str,
+    *,
+    required_text: Optional[str] = None,
+    min_length: Optional[int] = None,
+    timeout: Optional[int] = None,
+    attempts: Optional[int] = None,
+    retry_delay: Optional[float] = None,
+    page_name: str = "Page",
+) -> str:
+    """Load a page and retry when navigation succeeds but the DOM is not usable."""
+    max_attempts = max(1, attempts or int(getattr(config, "PAGE_FETCH_RETRIES", 3)))
+    base_delay = max(
+        0.0,
+        retry_delay
+        if retry_delay is not None
+        else float(getattr(config, "PAGE_FETCH_RETRY_DELAY_SECONDS", 2)),
+    )
+    required_length = max(
+        0,
+        min_length
+        if min_length is not None
+        else int(getattr(config, "PAGE_FETCH_MIN_BODY_LENGTH", 100)),
+    )
+
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            driver.get(url)
+            body_text = _wait_for_rendered_body_text(
+                driver,
+                required_text=required_text,
+                min_length=required_length,
+                timeout=timeout,
+            )
+            normalized = _normalize_text(body_text)
+
+            if required_text and required_text.upper() not in normalized.upper():
+                raise PageFetchError(f"required text {required_text!r} not found")
+            if required_length and len(normalized) < required_length:
+                raise PageFetchError(
+                    f"rendered body too short ({len(normalized)} chars)"
+                )
+            return body_text
+        except (TimeoutException, WebDriverException, PageFetchError) as exc:
+            last_error = exc
+            logger.warning(
+                "%s load attempt %s/%s failed: %s",
+                page_name,
+                attempt,
+                max_attempts,
+                exc,
+            )
+            if attempt < max_attempts and base_delay > 0:
+                time.sleep(base_delay * attempt)
+
+    raise PageFetchError(
+        f"{page_name} could not be loaded after {max_attempts} attempts"
+    ) from last_error
 
 
 # ── Core scraping logic ───────────────────────────────────────────────────────
@@ -100,27 +210,21 @@ def _scrape_page(driver: webdriver.Chrome) -> List[dict]:
     """
     results: List[dict] = []
 
-    # The page renders a table / card layout.
-    # We look for any element whose text contains the team name and then walk
-    # up / sideways to find the score element.
-    # Strategy: grab all text nodes, find rows containing TEAM_NAME.
-    try:
-        # Wait for at least one score element to appear
-        WebDriverWait(driver, config.PAGE_LOAD_WAIT).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "body"))
-        )
-    except TimeoutException:
+    body_text = _wait_for_rendered_body_text(
+        driver,
+        min_length=1,
+        timeout=config.PAGE_LOAD_WAIT,
+    )
+    if not body_text:
         logger.warning("Page load timed out")
         return results
 
-    # Try various CSS patterns the site may use
     candidates = _find_match_rows(driver)
-    for row_text in candidates:
-        parsed = _parse_row(row_text)
-        if parsed:
-            results.append(parsed)
-
-    return results
+    return _parse_candidate_rows(
+        candidates,
+        body_text=body_text,
+        page_name="Live results page",
+    )
 
 
 def _scrape_upcoming_page(driver: webdriver.Chrome) -> List[dict]:
@@ -131,15 +235,16 @@ def _scrape_upcoming_page(driver: webdriver.Chrome) -> List[dict]:
     matches: List[dict] = []
 
     try:
-        driver.get(config.UPCOMING_URL)
-        WebDriverWait(driver, config.PAGE_LOAD_WAIT).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "body"))
+        body_text = _load_page_with_retries(
+            driver,
+            config.UPCOMING_URL,
+            min_length=50,
+            page_name="Upcoming page",
         )
-    except TimeoutException:
-        logger.warning("Upcoming page load timed out")
+    except PageFetchError as exc:
+        logger.warning("Upcoming page load failed: %s", exc)
         return matches
 
-    # Find match elements (similar to live page)
     team = config.TEAM_NAME
     for selector in (
         "div.match",
@@ -156,8 +261,29 @@ def _scrape_upcoming_page(driver: webdriver.Chrome) -> List[dict]:
                     parsed = _parse_upcoming_row(el)
                     if parsed:
                         matches.append(parsed)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("_scrape_upcoming_page: selector %s raised %s", selector, exc)
+
+    matches = _dedupe_records(
+        matches,
+        ("team_home", "team_away", "home_odds", "draw_odds", "away_odds"),
+    )
+    if body_text and team in body_text.upper() and not matches:
+        logger.warning(
+            "Upcoming page mentions %s but no fixtures parsed. Check selectors.",
+            team,
+        )
+    elif matches and all(
+        match["home_odds"] is None
+        and match["draw_odds"] is None
+        and match["away_odds"] is None
+        for match in matches
+    ):
+        logger.warning(
+            "Upcoming fixtures were found but no odds were extracted. "
+            "Check ODDS_SELECTOR (%s).",
+            config.ODDS_SELECTOR,
+        )
 
     return matches
 
@@ -180,16 +306,28 @@ def _parse_upcoming_row(element) -> Optional[dict]:
     team_home = team_tokens[0]
     team_away = team_tokens[1]
 
-    # Extract odds – this is placeholder; need to inspect the page for actual selectors
+    # Extract odds – parse floats robustly and tolerate different formats
+    def _to_float(txt: str) -> Optional[float]:
+        if not txt:
+            return None
+        s = txt.strip().replace(',', '.')
+        m = re.search(r"(\d+(?:\.\d+)?)", s)
+        if not m:
+            return None
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+
     home_odds = draw_odds = away_odds = None
     try:
         odds_elements = element.find_elements(By.CSS_SELECTOR, config.ODDS_SELECTOR)
         if len(odds_elements) >= 3:
-            home_odds = float(odds_elements[0].text.strip())
-            draw_odds = float(odds_elements[1].text.strip())
-            away_odds = float(odds_elements[2].text.strip())
-    except (ValueError, IndexError):
-        pass
+            home_odds = _to_float(odds_elements[0].text)
+            draw_odds = _to_float(odds_elements[1].text)
+            away_odds = _to_float(odds_elements[2].text)
+    except Exception as exc:
+        logger.debug("_parse_upcoming_row: failed to parse odds: %s", exc)
 
     return {
         "team_home": team_home,
@@ -223,16 +361,17 @@ def _find_match_rows(driver: webdriver.Chrome) -> List[str]:
                 txt = el.text.strip()
                 if team in txt.upper() and _RESULT_RE.search(txt):
                     row_texts.append(txt)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("_find_match_rows: selector %s raised %s", selector, exc)
 
     if row_texts:
-        return row_texts
+        return _dedupe_text_rows(row_texts)
 
     # 2) Fallback: scan the full visible text line by line
     try:
         body_text = driver.find_element(By.TAG_NAME, "body").text
-    except Exception:
+    except Exception as exc:
+        logger.debug("_find_match_rows: failed to read body text: %s", exc)
         return []
 
     lines: List[str] = []
@@ -244,7 +383,7 @@ def _find_match_rows(driver: webdriver.Chrome) -> List[str]:
         if team in block.upper() and _RESULT_RE.search(block):
             lines.append(block)
 
-    return lines
+    return _dedupe_text_rows(lines)
 
 
 def _parse_row(row_text: str) -> Optional[dict]:
@@ -289,6 +428,51 @@ def _parse_row(row_text: str) -> Optional[dict]:
         "ft_home": ft_home,
         "ft_away": ft_away,
     }
+
+
+def _parse_candidate_rows(
+    candidates: List[str],
+    body_text: str = "",
+    page_name: str = "Page",
+) -> List[dict]:
+    """Parse candidate text blocks and emit diagnostics when extraction degrades."""
+    unique_candidates = _dedupe_text_rows(candidates)
+    results: List[dict] = []
+    rejected = 0
+
+    for row_text in unique_candidates:
+        parsed = _parse_row(row_text)
+        if not parsed:
+            rejected += 1
+            continue
+        results.append(parsed)
+
+    results = _dedupe_records(
+        results,
+        ("team_home", "team_away", "ft_home", "ft_away", "raw_result"),
+    )
+
+    if unique_candidates and not results:
+        logger.warning(
+            "%s yielded %s candidate row(s) but none parsed cleanly for %s.",
+            page_name,
+            len(unique_candidates),
+            config.TEAM_NAME,
+        )
+    elif body_text and config.TEAM_NAME in body_text.upper() and not unique_candidates:
+        logger.warning(
+            "%s mentions %s but no candidate score rows were found. Check selectors.",
+            page_name,
+            config.TEAM_NAME,
+        )
+    elif rejected:
+        logger.info(
+            "%s discarded %s candidate row(s) during parsing.",
+            page_name,
+            rejected,
+        )
+
+    return results
 
 
 def parse_matchday_text(page_text: str) -> List[dict]:
@@ -356,8 +540,13 @@ def discover_recent_season_ids(
     limit: int = config.HISTORICAL_SEASONS_LIMIT,
 ) -> List[int]:
     """Read the visible season list from the Betpawa Results page."""
-    driver.get(config.RESULTS_URL)
-    body_text = _wait_for_rendered_body_text(driver, required_text="Season #")
+    body_text = _load_page_with_retries(
+        driver,
+        config.RESULTS_URL,
+        required_text="Season #",
+        min_length=20,
+        page_name="Results page",
+    )
 
     season_ids: List[int] = []
     for raw in _SEASON_RE.findall(body_text):
@@ -432,16 +621,41 @@ def run_historical_backfill(
                     total_steps,
                     f"Season #{season_id} • Matchday {matchday:02d}",
                 )
-                driver.get(url)
-                body_text = _wait_for_rendered_body_text(
-                    driver,
-                    required_text=f"MATCH DAY: {matchday:02d}",
-                    min_length=150,
-                )
+                try:
+                    body_text = _load_page_with_retries(
+                        driver,
+                        url,
+                        required_text=f"MATCH DAY: {matchday:02d}",
+                        min_length=150,
+                        page_name=(
+                            f"Season #{season_id} matchday {matchday:02d}"
+                        ),
+                    )
+                except PageFetchError as exc:
+                    msg = (
+                        f"  Matchday {matchday:02d}: page load failed after retries "
+                        f"({exc})"
+                    )
+                    _log(msg)
+                    db.log_scrape("ERROR", msg.strip())
+                    _progress(
+                        completed_steps,
+                        total_steps,
+                        f"Season #{season_id} • Matchday {matchday:02d} failed",
+                    )
+                    continue
                 fixtures = parse_matchday_text(body_text)
 
                 if not fixtures:
-                    _log(f"  Matchday {matchday:02d}: no {config.TEAM_NAME} fixture found")
+                    if config.TEAM_NAME in body_text.upper():
+                        _log(
+                            f"  Matchday {matchday:02d}: {config.TEAM_NAME} was visible "
+                            "but no completed fixture parsed"
+                        )
+                    else:
+                        _log(
+                            f"  Matchday {matchday:02d}: no {config.TEAM_NAME} fixture found"
+                        )
                     _progress(
                         completed_steps,
                         total_steps,
@@ -479,7 +693,7 @@ def run_historical_backfill(
         _log(f"Historical backfill complete – {inserted} result(s) imported.")
         _progress(total_steps, total_steps, f"Historical import complete ({inserted} results)")
 
-    except WebDriverException as exc:
+    except (WebDriverException, PageFetchError) as exc:
         msg = f"Historical backfill failed: {exc}"
         _log(msg)
         db.log_scrape("ERROR", msg)
@@ -521,7 +735,18 @@ def run_scrape_session(
     try:
         driver = _build_driver()
         _log(f"Loading {config.TARGET_URL}")
-        driver.get(config.TARGET_URL)
+        try:
+            _load_page_with_retries(
+                driver,
+                config.TARGET_URL,
+                min_length=50,
+                page_name="Live results page",
+            )
+        except PageFetchError as exc:
+            msg = f"Live results page failed to load: {exc}"
+            _log(msg)
+            db.log_scrape("ERROR", msg)
+            return inserted
 
         session_end = time.time() + config.SCRAPE_SESSION_DURATION_SECONDS
         poll = config.SCRAPE_POLL_INTERVAL_SECONDS
@@ -548,7 +773,16 @@ def run_scrape_session(
 
             except WebDriverException as exc:
                 _log(f"  WebDriver error during poll: {exc}")
-                break
+                try:
+                    _load_page_with_retries(
+                        driver,
+                        config.TARGET_URL,
+                        min_length=50,
+                        page_name="Live results page refresh",
+                    )
+                except PageFetchError as reload_exc:
+                    _log(f"  Reload after poll failure did not recover: {reload_exc}")
+                    break
 
         # Store only the final (last) scraped results as definitive
         if latest_matches:

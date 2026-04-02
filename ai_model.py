@@ -24,7 +24,7 @@ import pickle
 import random
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple, cast
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, cast
 
 import numpy as np
 import torch
@@ -157,6 +157,10 @@ class GeneticAlgorithm:
         feature_window: int = config.GA_FEATURE_WINDOW,
         include_odds: bool = False,
         seed: Optional[int] = None,
+        mutation_rate_floor: float = getattr(config, "GA_MUTATION_RATE_FLOOR", 0.01),
+        mutation_rate_ceiling: float = getattr(config, "GA_MUTATION_RATE_CEILING", 0.35),
+        early_stop_patience: int = getattr(config, "GA_EARLY_STOP_PATIENCE", 40),
+        early_stop_min_delta: float = getattr(config, "GA_EARLY_STOP_MIN_DELTA", 0.0001),
     ):
         self.population_size = population_size
         self.generations = generations
@@ -166,6 +170,10 @@ class GeneticAlgorithm:
         self.feature_window = feature_window
         self.include_odds = include_odds
         self.seed = seed
+        self.mutation_rate_floor = mutation_rate_floor
+        self.mutation_rate_ceiling = mutation_rate_ceiling
+        self.early_stop_patience = early_stop_patience
+        self.early_stop_min_delta = early_stop_min_delta
         self.n_features = _feature_size(feature_window, include_odds)
         self.gene_length = N_ACTIONS * (self.n_features + 1)  # W + b
 
@@ -174,10 +182,9 @@ class GeneticAlgorithm:
         self.best_fitness: float = 0.0
         self.generation: int = 0
         self.fitness_history: List[float] = []
-
-        if self.seed is not None:
-            random.seed(self.seed)
-            np.random.seed(self.seed)
+        self._stagnation_generations: int = 0
+        self.rng = random.Random(self.seed)
+        self.np_rng = np.random.default_rng(self.seed)
 
         self._init_population()
 
@@ -185,7 +192,7 @@ class GeneticAlgorithm:
 
     def _init_population(self) -> None:
         self.population = [
-            np.random.randn(self.gene_length) * 0.5
+            self.np_rng.standard_normal(self.gene_length) * 0.5
             for _ in range(self.population_size)
         ]
 
@@ -205,10 +212,26 @@ class GeneticAlgorithm:
         e = np.exp(logits - np.max(logits))
         return e / e.sum()
 
+    def _evaluate_population_fitness(
+        self,
+        feature_matrix: np.ndarray,
+        labels: np.ndarray,
+    ) -> np.ndarray:
+        if feature_matrix.size == 0:
+            return np.zeros(len(self.population), dtype=float)
+
+        population = np.vstack(self.population)
+        w_size = N_ACTIONS * self.n_features
+        weights = population[:, :w_size].reshape(len(self.population), N_ACTIONS, self.n_features)
+        biases = population[:, w_size:]
+        logits = np.einsum("nf,paf->pna", feature_matrix, weights) + biases[:, None, :]
+        preds = np.argmax(logits, axis=2)
+        return np.mean(preds == labels, axis=1)
+
     def predict(self, features: np.ndarray) -> int:
         """Predict outcome using the best individual found so far."""
         if self.best_individual is None:
-            return random.choice(ACTIONS)
+            return self.rng.choice(ACTIONS)
         proba = self._predict_proba(self.best_individual, features)
         return ACTIONS[int(np.argmax(proba))]
 
@@ -233,25 +256,32 @@ class GeneticAlgorithm:
 
     # ── Genetic operators ─────────────────────────────────────────────────────
 
-    def _select(self, fitnesses: List[float]) -> np.ndarray:
+    def _select(self, fitnesses: Sequence[float]) -> np.ndarray:
         """Tournament selection (k=3)."""
-        k = 3
-        idxs = random.sample(range(len(self.population)), k)
+        k = min(3, len(self.population))
+        idxs = self.rng.sample(range(len(self.population)), k)
         best_idx = max(idxs, key=lambda i: fitnesses[i])
         return self.population[best_idx].copy()
 
     def _crossover(self, p1: np.ndarray, p2: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        if random.random() > self.crossover_rate:
+        if self.rng.random() > self.crossover_rate:
             return p1.copy(), p2.copy()
-        point = random.randint(1, len(p1) - 1)
-        c1 = np.concatenate([p1[:point], p2[point:]])
-        c2 = np.concatenate([p2[:point], p1[point:]])
+        blend = self.np_rng.random(len(p1))
+        c1 = blend * p1 + (1.0 - blend) * p2
+        c2 = blend * p2 + (1.0 - blend) * p1
         return c1, c2
 
-    def _mutate(self, individual: np.ndarray) -> np.ndarray:
-        for i in range(len(individual)):
-            if random.random() < self.mutation_rate:
-                individual[i] += np.random.randn() * 0.1
+    def _current_mutation_rate(self) -> float:
+        rate = self.mutation_rate * (1.0 + 0.05 * self._stagnation_generations)
+        return min(self.mutation_rate_ceiling, max(self.mutation_rate_floor, rate))
+
+    def _mutate(self, individual: np.ndarray, mutation_rate: Optional[float] = None) -> np.ndarray:
+        rate = self.mutation_rate if mutation_rate is None else mutation_rate
+        if rate <= 0.0:
+            return individual
+        mask = self.np_rng.random(individual.size) < rate
+        if np.any(mask):
+            individual[mask] += self.np_rng.standard_normal(mask.sum()) * 0.1
         return individual
 
     # ── Training ─────────────────────────────────────────────────────────────
@@ -289,6 +319,12 @@ class GeneticAlgorithm:
             fit = self.train_one_generation_from_cache(feature_matrix, labels)
             if callback:
                 callback(generation=self.generation, best_fitness=fit)
+            if self._stagnation_generations >= self.early_stop_patience:
+                logger.info(
+                    "GA early stopping after low improvement for %s generations",
+                    self._stagnation_generations,
+                )
+                break
 
     def train_one_generation_from_cache(
         self,
@@ -299,30 +335,36 @@ class GeneticAlgorithm:
         if feature_matrix.size == 0:
             return 0.0
 
-        fitnesses = [
-            self.evaluate_fitness(ind, feature_matrix, labels)
-            for ind in self.population
-        ]
+        fitnesses = self._evaluate_population_fitness(feature_matrix, labels)
+        fitness_list = fitnesses.tolist()
 
-        sorted_idx = sorted(range(len(fitnesses)), key=lambda i: fitnesses[i], reverse=True)
-        new_pop = [self.population[i].copy() for i in sorted_idx[: self.elitism]]
+        elite_count = min(self.elitism, len(self.population))
+        elite_idx = np.argpartition(fitnesses, -elite_count)[-elite_count:]
+        elite_idx = elite_idx[np.argsort(fitnesses[elite_idx])[::-1]]
+        new_pop = [self.population[i].copy() for i in elite_idx]
+
+        best_idx = int(np.argmax(fitnesses))
+        gen_best = float(fitnesses[best_idx])
+        best_candidate = self.population[best_idx].copy()
+        mutation_rate = self._current_mutation_rate()
 
         while len(new_pop) < self.population_size:
-            p1 = self._select(fitnesses)
-            p2 = self._select(fitnesses)
+            p1 = self._select(fitness_list)
+            p2 = self._select(fitness_list)
             c1, c2 = self._crossover(p1, p2)
-            new_pop.append(self._mutate(c1))
+            new_pop.append(self._mutate(c1, mutation_rate))
             if len(new_pop) < self.population_size:
-                new_pop.append(self._mutate(c2))
+                new_pop.append(self._mutate(c2, mutation_rate))
 
         self.population = new_pop[:self.population_size]
         self.generation += 1
 
-        best_idx = int(np.argmax(fitnesses))
-        gen_best = fitnesses[best_idx]
-        if gen_best >= self.best_fitness:
+        if self.best_individual is None or gen_best > self.best_fitness + self.early_stop_min_delta:
             self.best_fitness = gen_best
-            self.best_individual = self.population[0].copy()
+            self.best_individual = best_candidate
+            self._stagnation_generations = 0
+        else:
+            self._stagnation_generations += 1
 
         self.fitness_history.append(gen_best)
         return gen_best
@@ -422,6 +464,9 @@ class QLearning:
         epsilon_decay: float = config.QL_EPSILON_DECAY,
         epsilon_min: float = config.QL_EPSILON_MIN,
         state_window: int = config.QL_STATE_WINDOW,
+        replay_passes: int = getattr(config, "QL_REPLAY_PASSES", 3),
+        replay_min_td_error: float = getattr(config, "QL_REPLAY_MIN_TD_ERROR", 0.0001),
+        replay_early_stop_patience: int = getattr(config, "QL_REPLAY_EARLY_STOP_PATIENCE", 2),
     ):
         self.lr = learning_rate
         self.gamma = discount
@@ -429,12 +474,16 @@ class QLearning:
         self.epsilon_decay = epsilon_decay
         self.epsilon_min = epsilon_min
         self.state_window = state_window
+        self.replay_passes = replay_passes
+        self.replay_min_td_error = replay_min_td_error
+        self.replay_early_stop_patience = replay_early_stop_patience
 
         self.q_table: Dict[Tuple[State, int], float] = {}
         self.total_steps = 0
         self.total_reward = 0.0
         self.correct_predictions = 0
         self.reward_history: List[float] = []
+        self._replay_stagnation: int = 0
 
     # ── Q-table helpers ──────────────────────────────────────────────────────
 
@@ -481,6 +530,53 @@ class QLearning:
     def _decay_epsilon(self) -> None:
         self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
 
+    def _build_replay_transitions(self, outcomes: List[int]) -> List[Tuple[State, int, float, State]]:
+        w = self.state_window
+        transitions: List[Tuple[State, int, float, State]] = []
+        for i in range(w, len(outcomes)):
+            state = self._get_state(outcomes[:i])
+            actual = outcomes[i]
+            next_state = self._get_state(outcomes[: i + 1])
+            transitions.append((state, actual, 1.0, next_state))
+        return transitions
+
+    def _train_on_transition_batch(
+        self,
+        transitions: List[Tuple[State, int, float, State]],
+        callback=None,
+    ) -> float:
+        if not transitions:
+            return 0.0
+
+        td_errors: List[float] = []
+        for state, actual, reward, next_state in transitions:
+            action = self.choose_action(state)
+            reward_value = reward if action == actual else -reward
+            best_next = max(self._q(next_state, a) for a in ACTIONS)
+            old_q = self._q(state, action)
+            target = reward_value + self.gamma * best_next
+            td_error = target - old_q
+            new_q = old_q + self.lr * td_error
+            self._set_q(state, action, new_q)
+
+            self.total_steps += 1
+            self.total_reward += reward_value
+            if reward_value > 0:
+                self.correct_predictions += 1
+            self.reward_history.append(reward_value)
+            self._decay_epsilon()
+            td_errors.append(abs(td_error))
+
+            if callback:
+                callback(
+                    step=self.total_steps,
+                    reward=reward_value,
+                    epsilon=self.epsilon,
+                    q_table_size=len(self.q_table),
+                )
+
+        return float(np.mean(td_errors))
+
     # ── Training ─────────────────────────────────────────────────────────────
 
     def train(
@@ -491,30 +587,20 @@ class QLearning:
         """
         Replay all stored outcomes sequentially to train the Q-table.
         """
-        w = self.state_window
-        for i in range(w, len(outcomes)):
-            state = self._get_state(outcomes[:i])
-            action = self.choose_action(state)
-            actual = outcomes[i]
-            reward = 1.0 if action == actual else -1.0
-
-            next_state = self._get_state(outcomes[: i + 1])
-            self.update(state, action, reward, next_state)
-
-            self.total_steps += 1
-            self.total_reward += reward
-            if reward > 0:
-                self.correct_predictions += 1
-            self.reward_history.append(reward)
-            self._decay_epsilon()
-
-            if callback:
-                callback(
-                    step=self.total_steps,
-                    reward=reward,
-                    epsilon=self.epsilon,
-                    q_table_size=len(self.q_table),
+        transitions = self._build_replay_transitions(outcomes)
+        passes = max(1, self.replay_passes)
+        for _ in range(passes):
+            mean_td_error = self._train_on_transition_batch(transitions, callback=callback)
+            if mean_td_error <= self.replay_min_td_error:
+                self._replay_stagnation += 1
+            else:
+                self._replay_stagnation = 0
+            if self._replay_stagnation >= self.replay_early_stop_patience:
+                logger.info(
+                    "QL early stopping after low TD error (%.6f)",
+                    mean_td_error,
                 )
+                break
 
     def predict_next(self, outcomes: List[int]) -> int:
         """Predict the next outcome using the greedy policy."""
@@ -584,11 +670,17 @@ class QLearning:
 # ── LSTM ──────────────────────────────────────────────────────────────────────
 
 class PyTorchLSTM(nn.Module):
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int, num_classes: int = 3):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int, num_classes: int = 3, dropout: float = 0.0):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        self.lstm = nn.LSTM(
+            input_size,
+            hidden_size,
+            num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
+        )
         self.fc = nn.Linear(hidden_size, num_classes)
 
     def forward(self, x):
@@ -605,13 +697,33 @@ class LSTMPredictor:
         hidden_size: int = getattr(config, "LSTM_HIDDEN_SIZE", 32),
         num_layers: int = getattr(config, "LSTM_NUM_LAYERS", 2),
         lr: float = getattr(config, "LSTM_LEARNING_RATE", 0.005),
+        dropout: float = getattr(config, "LSTM_DROPOUT", 0.2),
+        batch_size: int = getattr(config, "LSTM_BATCH_SIZE", 32),
+        validation_split: float = getattr(config, "LSTM_VALIDATION_SPLIT", 0.2),
+        early_stop_patience: int = getattr(config, "LSTM_EARLY_STOP_PATIENCE", 12),
+        min_delta: float = getattr(config, "LSTM_MIN_DELTA", 0.0001),
+        lr_factor: float = getattr(config, "LSTM_LR_FACTOR", 0.5),
+        lr_patience: int = getattr(config, "LSTM_LR_PATIENCE", 4),
     ):
         self.seq_length = seq_length
         self.input_size = 3  # encoded outcome, mun goals, opp goals
+        self.batch_size = batch_size
+        self.validation_split = validation_split
+        self.early_stop_patience = early_stop_patience
+        self.min_delta = min_delta
+        self.lr_factor = lr_factor
+        self.lr_patience = lr_patience
         
-        self.model = PyTorchLSTM(self.input_size, hidden_size, num_layers)
+        self.model = PyTorchLSTM(self.input_size, hidden_size, num_layers, dropout=dropout)
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode="min",
+            factor=self.lr_factor,
+            patience=self.lr_patience,
+            min_lr=1e-5,
+        )
 
     def _step_feature(self, outcome: int, mun_g: int, opp_g: int) -> List[float]:
         enc = {config.RESULT_LOSS: 0.0, config.RESULT_DRAW: 0.5, config.RESULT_WIN: 1.0}[outcome]
@@ -622,10 +734,7 @@ class LSTMPredictor:
             return goals[index]
         return (0, 0)
 
-    def train(self, outcomes: List[int], goals: List[Tuple[int, int]], epochs: int = 50) -> None:
-        if len(outcomes) <= self.seq_length:
-            return
-
+    def _build_dataset(self, outcomes: List[int], goals: List[Tuple[int, int]]) -> Tuple[torch.Tensor, torch.Tensor]:
         X, y = [], []
         for i in range(len(outcomes) - self.seq_length):
             seq_X = [
@@ -634,42 +743,93 @@ class LSTMPredictor:
             ]
             X.append(seq_X)
             y.append(outcomes[i + self.seq_length])
-        
+
+        if not X:
+            return torch.empty((0, self.seq_length, self.input_size), dtype=torch.float32), torch.empty((0,), dtype=torch.long)
+
         X_tensor = torch.tensor(X, dtype=torch.float32)
         y_tensor = torch.tensor(y, dtype=torch.long)
+        return X_tensor, y_tensor
+
+    def train(self, outcomes: List[int], goals: List[Tuple[int, int]], epochs: int = 50) -> None:
+        if len(outcomes) <= self.seq_length:
+            return
+
+        X_tensor, y_tensor = self._build_dataset(outcomes, goals)
+        if X_tensor.size(0) == 0:
+            return
+
+        split_idx = int(len(X_tensor) * (1.0 - self.validation_split))
+        split_idx = max(1, min(split_idx, len(X_tensor) - 1)) if len(X_tensor) > 1 else len(X_tensor)
+        train_X, val_X = X_tensor[:split_idx], X_tensor[split_idx:]
+        train_y, val_y = y_tensor[:split_idx], y_tensor[split_idx:]
+
+        train_dataset = torch.utils.data.TensorDataset(train_X, train_y)
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=min(self.batch_size, len(train_dataset)),
+            shuffle=True,
+            drop_last=False,
+        )
 
         self.model.train()
+        best_val_loss = float("inf")
+        stalled_epochs = 0
         for _ in range(epochs):
-            self.optimizer.zero_grad()
-            outputs = self.model(X_tensor)
-            loss = self.criterion(outputs, y_tensor)
-            loss.backward()
-            self.optimizer.step()
+            epoch_loss = 0.0
+            for batch_X, batch_y in train_loader:
+                self.optimizer.zero_grad()
+                outputs = self.model(batch_X)
+                loss = self.criterion(outputs, batch_y)
+                loss.backward()
+                self.optimizer.step()
+                epoch_loss += float(loss.item()) * len(batch_X)
+
+            train_loss = epoch_loss / len(train_dataset)
+            if len(val_X) > 0:
+                self.model.eval()
+                with torch.no_grad():
+                    val_logits = self.model(val_X)
+                    val_loss = float(self.criterion(val_logits, val_y).item())
+                self.scheduler.step(val_loss)
+                if val_loss + self.min_delta < best_val_loss:
+                    best_val_loss = val_loss
+                    stalled_epochs = 0
+                else:
+                    stalled_epochs += 1
+                self.model.train()
+                if stalled_epochs >= self.early_stop_patience:
+                    break
+            else:
+                self.scheduler.step(train_loss)
 
     def predict_next(self, outcomes: List[int], goals: List[Tuple[int, int]]) -> Tuple[int, float]:
         if len(outcomes) == 0:
             return config.RESULT_DRAW, 0.0
-        
+
         self.model.eval()
         seq_X = []
-        
+
         start_idx = max(0, len(outcomes) - self.seq_length)
         pad_count = self.seq_length - (len(outcomes) - start_idx)
-        
+
         for _ in range(pad_count):
             seq_X.append(self._step_feature(config.RESULT_DRAW, 0, 0)) # Default padding
-        
+
         for i in range(start_idx, len(outcomes)):
             seq_X.append(self._step_feature(outcomes[i], *self._goal_or_default(goals, i)))
-        
-        with torch.no_grad():
-            x_tensor = torch.tensor([seq_X], dtype=torch.float32)
-            logits = self.model(x_tensor)
-            probs = torch.softmax(logits, dim=1).squeeze(0)
-            pred = int(torch.argmax(probs).item())
-            conf = float(probs[pred].item())
-            
-        return ACTIONS[pred], conf
+
+        try:
+            with torch.no_grad():
+                x_tensor = torch.tensor([seq_X], dtype=torch.float32)
+                logits = self.model(x_tensor)
+                probs = torch.softmax(logits, dim=1).squeeze(0)
+                pred = int(torch.argmax(probs).item())
+                conf = float(probs[pred].item())
+            return ACTIONS[pred], conf
+        except Exception as exc:
+            logger.warning("LSTM prediction failed: %s", exc)
+            return config.RESULT_DRAW, 0.0
 
     def state_dict(self) -> Dict[str, object]:
         return {
@@ -678,6 +838,7 @@ class LSTMPredictor:
             "input_size": self.input_size,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "scheduler_state_dict": self.scheduler.state_dict(),
         }
 
     def load_state_dict(self, state: Dict[str, object]) -> None:
@@ -688,6 +849,9 @@ class LSTMPredictor:
 
         self.model.load_state_dict(cast(Mapping[str, Any], _as_dict(state["model_state_dict"])))
         self.optimizer.load_state_dict(cast(Dict[str, Any], _as_dict(state["optimizer_state_dict"])))
+        scheduler_state = state.get("scheduler_state_dict")
+        if scheduler_state is not None:
+            self.scheduler.load_state_dict(cast(Dict[str, Any], _as_dict(scheduler_state)))
 
     def save(self, path: str) -> None:
         checkpoint = Path(path)
